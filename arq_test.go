@@ -83,8 +83,16 @@ func TestARQLossy(t *testing.T) {
 			var gotB, gotA []byte
 			var errs [4]error
 
-			go func() { defer wg.Done(); _, errs[0] = io.Copy(writerOnly{link.a}, bytes.NewReader(payload)); link.a.CloseWrite() }()
-			go func() { defer wg.Done(); _, errs[1] = io.Copy(writerOnly{link.b}, bytes.NewReader(reply)); link.b.CloseWrite() }()
+			go func() {
+				defer wg.Done()
+				_, errs[0] = io.Copy(writerOnly{link.a}, bytes.NewReader(payload))
+				link.a.CloseWrite()
+			}()
+			go func() {
+				defer wg.Done()
+				_, errs[1] = io.Copy(writerOnly{link.b}, bytes.NewReader(reply))
+				link.b.CloseWrite()
+			}()
 			go func() { defer wg.Done(); gotB, errs[2] = io.ReadAll(link.b) }()
 			go func() { defer wg.Done(); gotA, errs[3] = io.ReadAll(link.a) }()
 

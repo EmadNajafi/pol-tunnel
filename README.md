@@ -32,14 +32,16 @@
 
 ```
 Handshake (روی هر اتصال):
-  S→C  "POL1" | nonce[32]
-  C→S  kind[1] | HMAC-SHA256(token, "pol-c"|nonce|kind)
-  S→C  HMAC-SHA256(token, "pol-s"|nonce|kind)        ← احراز هویت دوطرفه
+  S→C  "POL2" | sFlags[1] | sEphPub[32] | nonce[32]
+  C→S  kind[1] | cFlags[1] | cEphPub[32] | HMAC-SHA256(token, "pol-c"|transcript)
+  S→C  HMAC-SHA256(token, "pol-s"|transcript)        ← احراز هویت دوطرفه
+  transcript = nonce | kind | sFlags | cFlags | sEphPub | cEphPub
   توکن غلط ⇒ سرور ساکت می‌ماند و اتصال را می‌بندد.
+  اگر هر دو طرف encryption بخواهند ⇒ X25519 + HKDF ⇒ AES-256-GCM
 
 kind: 1=control  2=data(pool)  3=mux session
 
-Open header:  proto[1] (1=tcp 2=udp) | len[1] | "host:port"
+Open header:  proto[1] (1=tcp 2=udp) | tlen[1] | target | slen[1] | src
 Mux frame:    cmd[1] | streamID[4] | len[2] | payload
               SYN, DATA, FIN(half-close), RST, WND(flow control), PING, PONG
 UDP روی stream:  len[2] | datagram
@@ -64,7 +66,7 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/EmadNajafi/pol-tunnel/m
 poltunnel
 ```
 
-**یا دستی:** باینری‌های لینوکس در `dist/` هستند (`pol-linux-amd64`، `pol-linux-arm64`). برای build:
+**یا دستی:** باینری‌های لینوکس (`pol-linux-amd64`، `pol-linux-arm64`) به‌همراه `SHA256SUMS` در [Releases](https://github.com/EmadNajafi/pol-tunnel/releases) هستند (اسکریپت نصب checksum را خودش بررسی می‌کند). یا خودتان build کنید:
 
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o pol .
@@ -80,10 +82,11 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o pol
 
 ```bash
 # روی سروری که میزبان تانل می‌شود (مثلاً ایران):
-./pol -test-agent :46000
+./pol -test-agent :46000          # یک «test key» چاپ می‌کند
 # روی سرور دیگر:
-./pol -test-run HOST_IP:46000
+./pol -test-run HOST_IP:46000     # test key را می‌پرسد (یا: -test-key KEY)
 ```
+اتصال کنترلی با این کلید احراز هویت می‌شود (کلید روی سیم نمی‌رود) و توکن تانل‌های تست هم از آن مشتق می‌شود؛ پس کسی که فقط به پورت agent دسترسی دارد نمی‌تواند آن را کنترل کند. همه‌ی ورودی‌ها (ترنسپورت، پورت، IP) هم اعتبارسنجی می‌شوند.
 خروجی سمت runner:
 ```
   testing tcp       ... ✓
@@ -161,7 +164,7 @@ systemctl daemon-reload && systemctl enable --now pol
 - **tcpmux**: پیش‌فرض خوب. تعداد اتصال‌ها بین دو سرور ثابت است و سربار handshake برای هر کاربر ندارد.
 - **tcp**: هر کاربر یک اتصال واقعی دارد. برای ترافیک حجیم و تعداد اتصال کم مناسب است.
 - **ws / wsmux**: برای عبور از CDN (مثلاً Cloudflare)؛ با `edge_ip` و دامنه در `remote_addr` / `tls_sni`.
-- **wss / wssmux**: رمزنگاری TLS. بدون `tls_cert` یک گواهی self-signed ساخته می‌شود.
+- **wss / wssmux**: رمزنگاری TLS. بدون `tls_cert` یک گواهی self-signed ساخته می‌شود. با گواهی self-signed (`tls_insecure = true`) هویت سرور با TLS بررسی نمی‌شود؛ احراز هویت با توکن همچنان امن است، ولی کسی که وسط مسیر باشد می‌تواند لایه‌ی TLS را باز کند. برای محرمانگی کامل `encryption = true` را هم روشن کنید (کلیدش به توکن گره خورده است).
 - **spoof / spoofmux**: روی UDP با لایه‌ی اطمینان‌پذیری ARQ (شبیه KCP)، با قابلیت **جعل IP مبدأ**. بخش ۷ را ببینید.
 
 ### رمزنگاری روی هر ترنسپورت (`encryption = true`)
@@ -215,6 +218,8 @@ remote_addrs = ["5.6.7.8:443", "example.com:443"]
 علاوه بر تونل معکوس، pol یک **حالت دایرکت** دارد: یک اینترفیس **TUN لایه‌۳** روی هر طرف که **کل بسته‌های IP** را می‌برد (نه فقط چند پورت). مثل حالت direct در BackPack.
 
 - **رمزنگاری:** یک دست‌دادنِ شبیه Noise — تبادل کلید **X25519** (forward secrecy) با احراز هویت توسط توکن (HMAC)، بعد **AES-256-GCM** روی هر بسته. همه با کتابخانه‌ی استاندارد Go.
+- **ضد-replay در دست‌دادن:** پیام INIT برچسب زمانی دارد (حداکثر ±۱۲۰ ثانیه اختلاف ساعت — ساعت سرورها را با NTP همگام نگه دارید) و سرور INITهای تکراری را رد می‌کند. کلیدهای جدید فقط بعد از رسیدن اولین بسته‌ی DATA معتبر جایگزین می‌شوند، پس یک INIT ضبط‌شده نمی‌تواند تونل را قطع کند یا مسیرش را عوض کند.
+- **keepalive و اتصال مجدد:** هر دو طرف هر ۱۰ ثانیه یک بسته‌ی خالی رمزشده می‌فرستند؛ اگر کلاینت ۴۵ ثانیه چیزی نگیرد (مثلاً سرور ری‌استارت شده) دوباره دست می‌دهد.
 - **حمل‌ونقل:** UDP (هر بسته‌ی IP داخل یک دیتاگرام رمزشده).
 - **MTU:** پیش‌فرض ۱۴۰۰ تا بعد از سربار IP/UDP/nonce/tag جا شود.
 - فقط یک آدرس point-to-point اضافه می‌کند؛ **مسیر default را دست نمی‌زند**، پس به شبکه‌ی موجود سرور آسیب نمی‌زند.
