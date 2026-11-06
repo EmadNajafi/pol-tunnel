@@ -52,7 +52,13 @@ UDP روی stream:  len[2] | datagram
 
 ## ۳. نصب و اجرا
 
-باینری‌های لینوکس در `dist/` هستند (`pol-linux-amd64`، `pol-linux-arm64`). برای build:
+**نصب سریع با منوی تعاملی** (مثل Backhaul/BackPack — نصب، ساخت تونل، start/stop/status، همه با منو):
+
+```bash
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/EmadNajafi/pol-tunnel/main/install.sh)
+```
+
+**یا دستی:** باینری‌های لینوکس در `dist/` هستند (`pol-linux-amd64`، `pol-linux-arm64`). برای build:
 
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o pol .
