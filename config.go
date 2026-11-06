@@ -34,6 +34,7 @@ type Common struct {
 	ChannelSize   int
 	DialTimeout   time.Duration
 	UDPIdle       time.Duration
+	Encryption    bool // wrap the transport in AES-256-GCM after an X25519 handshake
 }
 
 type ServerConfig struct {
@@ -48,10 +49,22 @@ type ServerConfig struct {
 type ClientConfig struct {
 	Common
 	RemoteAddr     string
+	RemoteAddrs    []string // extra backup server addresses; client fails over between them
 	EdgeIP         string
 	ConnectionPool int
 	RetryInterval  time.Duration
 	SpoofSource    string // spoof: forge this source IP on outgoing packets (Linux, root)
+	ProxyProtocol  bool   // send PROXY protocol v2 to the backend (real visitor IP)
+}
+
+// allRemotes is the ordered list of server addresses to try (primary first).
+func (c *ClientConfig) allRemotes() []string {
+	var out []string
+	if c.RemoteAddr != "" {
+		out = append(out, c.RemoteAddr)
+	}
+	out = append(out, c.RemoteAddrs...)
+	return out
 }
 
 func defaultCommon() Common {
@@ -255,6 +268,7 @@ func loadCommon(s section) Common {
 	c.ChannelSize = s.num("channel_size", c.ChannelSize)
 	c.DialTimeout = s.secs("dial_timeout", c.DialTimeout)
 	c.UDPIdle = s.secs("udp_idle_timeout", c.UDPIdle)
+	c.Encryption = s.boolean("encryption", false)
 	if c.MuxFrameSize < 1024 || c.MuxFrameSize > 65535 {
 		c.MuxFrameSize = 32 * 1024
 	}
@@ -289,15 +303,19 @@ func LoadConfig(path string) (*Config, error) {
 		sec := section(s)
 		cc := &ClientConfig{Common: loadCommon(sec)}
 		cc.RemoteAddr = sec.str("remote_addr", "")
+		if arr, ok := sec["remote_addrs"].([]string); ok {
+			cc.RemoteAddrs = arr
+		}
 		cc.EdgeIP = sec.str("edge_ip", "")
 		cc.SpoofSource = sec.str("spoof_source", "")
+		cc.ProxyProtocol = sec.boolean("proxy_protocol", false)
 		cc.ConnectionPool = sec.num("connection_pool", 8)
 		cc.RetryInterval = sec.secs("retry_interval", 3*time.Second)
 		if cc.ConnectionPool < 1 {
 			cc.ConnectionPool = 1
 		}
-		if cc.RemoteAddr == "" {
-			return nil, fmt.Errorf("client.remote_addr is required")
+		if len(cc.allRemotes()) == 0 {
+			return nil, fmt.Errorf("client needs remote_addr (or remote_addrs)")
 		}
 		cfg.Client = cc
 	}

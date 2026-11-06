@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -161,52 +162,71 @@ func NewDialer(cfg *ClientConfig) Dialer {
 	if strings.HasPrefix(cfg.Transport, "spoof") {
 		return newSpoofDialer(cfg)
 	}
-	host, _, err := net.SplitHostPort(cfg.RemoteAddr)
-	if err != nil {
-		host = cfg.RemoteAddr
-	}
-	dialAddr := cfg.RemoteAddr
-	if cfg.EdgeIP != "" { // connect to a CDN edge, keep Host/SNI of the real domain
-		_, port, _ := net.SplitHostPort(cfg.RemoteAddr)
-		dialAddr = net.JoinHostPort(cfg.EdgeIP, port)
-	}
+	addrs := cfg.allRemotes()
 	cm := &cfg.Common
+	var idx atomic.Uint32
 	return func(ctx context.Context) (net.Conn, error) {
-		d := net.Dialer{Timeout: cm.DialTimeout}
-		c, err := d.DialContext(ctx, "tcp", dialAddr)
+		// Rotate the address on every attempt, so a dead server is skipped on the
+		// next retry and backups are tried deterministically (round-robin across
+		// however many are healthy).
+		remote := addrs[int(idx.Add(1)-1)%len(addrs)]
+		c, err := dialOne(ctx, cm, remote, cfg.EdgeIP)
 		if err != nil {
+			if len(addrs) > 1 {
+				logf("debug", "dial %s failed, will try the next address: %v", remote, err)
+			}
 			return nil, err
 		}
-		tuneTCP(c, cm)
-		t := cm.Transport
-		if t == "tcp" || t == "tcpmux" {
-			return c, nil
+		return c, nil
+	}
+}
+
+// dialOne connects once to a single server address, applying the transport
+// (tcp / ws / wss) and edge-IP / SNI handling.
+func dialOne(ctx context.Context, cm *Common, remote, edgeIP string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(remote)
+	if err != nil {
+		host = remote
+	}
+	dialAddr := remote
+	if edgeIP != "" { // connect to a CDN edge, keep Host/SNI of the real domain
+		_, port, _ := net.SplitHostPort(remote)
+		dialAddr = net.JoinHostPort(edgeIP, port)
+	}
+	d := net.Dialer{Timeout: cm.DialTimeout}
+	c, err := d.DialContext(ctx, "tcp", dialAddr)
+	if err != nil {
+		return nil, err
+	}
+	tuneTCP(c, cm)
+	t := cm.Transport
+	if t == "tcp" || t == "tcpmux" {
+		return c, nil
+	}
+	c.SetDeadline(time.Now().Add(cm.DialTimeout))
+	if strings.HasPrefix(t, "wss") {
+		sni := cm.TLSSNI
+		if sni == "" {
+			sni = host
 		}
-		c.SetDeadline(time.Now().Add(cm.DialTimeout))
-		if strings.HasPrefix(t, "wss") {
-			sni := cm.TLSSNI
-			if sni == "" {
-				sni = host
-			}
-			tc := tls.Client(c, &tls.Config{ServerName: sni, InsecureSkipVerify: cm.TLSInsecure, MinVersion: tls.VersionTLS12})
-			if err := tc.HandshakeContext(ctx); err != nil {
-				c.Close()
-				return nil, err
-			}
-			c = tc
-		}
-		hostHeader := cfg.RemoteAddr
-		if cm.TLSSNI != "" {
-			hostHeader = cm.TLSSNI
-		}
-		wc, err := wsClientUpgrade(c, hostHeader, cm.Path)
-		if err != nil {
+		tc := tls.Client(c, &tls.Config{ServerName: sni, InsecureSkipVerify: cm.TLSInsecure, MinVersion: tls.VersionTLS12})
+		if err := tc.HandshakeContext(ctx); err != nil {
 			c.Close()
 			return nil, err
 		}
-		c.SetDeadline(time.Time{})
-		return wc, nil
+		c = tc
 	}
+	hostHeader := remote
+	if cm.TLSSNI != "" {
+		hostHeader = cm.TLSSNI
+	}
+	wc, err := wsClientUpgrade(c, hostHeader, cm.Path)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+	c.SetDeadline(time.Time{})
+	return wc, nil
 }
 
 var errNoConn = errors.New("no tunnel connection available")

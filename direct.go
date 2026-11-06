@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/ecdh"
+	"encoding/binary"
 	"net"
 	"sync"
 	"time"
@@ -28,6 +29,7 @@ type directEngine struct {
 
 	mu        sync.RWMutex
 	keys      *directKeys
+	replay    *replayWindow
 	peerAddr  *net.UDPAddr
 	up        bool
 	clientEph *ecdh.PrivateKey
@@ -79,6 +81,7 @@ func RunDirect(cfg *DirectConfig) error {
 func (e *directEngine) setKeys(k *directKeys, peer *net.UDPAddr) {
 	e.mu.Lock()
 	e.keys = k
+	e.replay = &replayWindow{} // fresh anti-replay state per handshake
 	if peer != nil {
 		e.peerAddr = peer
 	}
@@ -150,14 +153,20 @@ func (e *directEngine) udpToTun() {
 			e.handleResp(buf[:n])
 		case dirDATA:
 			e.mu.RLock()
-			k := e.keys
+			k, rw := e.keys, e.replay
 			e.mu.RUnlock()
-			if k == nil {
+			if k == nil || n < 1+gcmNonce+gcmTag {
 				continue
 			}
 			plain, err := k.recv.open(buf[1:n])
 			if err != nil {
 				logf("debug", "direct: decrypt failed: %v", err)
+				continue
+			}
+			// the counter lives in the authenticated nonce (sealed[4:12]); drop replays
+			ctr := binary.BigEndian.Uint64(buf[1+4 : 1+gcmNonce])
+			if rw != nil && !rw.check(ctr) {
+				logf("debug", "direct: dropped replayed/old packet %d", ctr)
 				continue
 			}
 			e.tun.Write(plain)

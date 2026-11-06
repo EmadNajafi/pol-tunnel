@@ -3,6 +3,7 @@
 bind_addr = "0.0.0.0:3080"
 transport = "tcpmux"          # tcp | tcpmux | ws | wsmux | wss | wssmux
 token = "CHANGE_ME"
+encryption = true             # X25519 + AES-256-GCM over any transport (match on both ends)
 accept_udp = false            # also forward UDP on the same ports
 nodelay = true
 keepalive_period = 75         # seconds

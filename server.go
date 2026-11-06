@@ -75,12 +75,12 @@ func (s *Server) Run() error {
 	}
 }
 
-func (s *Server) handleTunnelConn(c net.Conn) {
-	kind, err := serverHandshake(c, s.cfg.Token)
+func (s *Server) handleTunnelConn(raw net.Conn) {
+	kind, c, err := serverHandshake(raw, s.cfg.Token, s.cfg.Encryption)
 	if err != nil {
-		logf("debug", "handshake from %s failed: %v", c.RemoteAddr(), err)
+		logf("debug", "handshake from %s failed: %v", raw.RemoteAddr(), err)
 		time.Sleep(time.Second) // don't give probers a fast oracle
-		c.Close()
+		raw.Close()
 		return
 	}
 	mux := isMux(s.cfg.Transport)
@@ -233,7 +233,7 @@ func (s *Server) takeDataConn() (net.Conn, error) {
 }
 
 // open returns a tunnel stream to the client that will forward to target.
-func (s *Server) open(proto byte, target string) (io.ReadWriteCloser, error) {
+func (s *Server) open(proto byte, target, src string) (io.ReadWriteCloser, error) {
 	if isMux(s.cfg.Transport) {
 		s.sessMu.Lock()
 		var best *Session
@@ -251,7 +251,7 @@ func (s *Server) open(proto byte, target string) (io.ReadWriteCloser, error) {
 		if best == nil {
 			return nil, errNoConn
 		}
-		return best.Open(proto, target)
+		return best.Open(proto, target, src)
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		c, err := s.takeDataConn()
@@ -259,7 +259,7 @@ func (s *Server) open(proto byte, target string) (io.ReadWriteCloser, error) {
 			return nil, err
 		}
 		c.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		err = writeOpenHeader(c, proto, target)
+		err = writeOpenHeader(c, proto, target, src)
 		c.SetWriteDeadline(time.Time{})
 		if err == nil {
 			return c, nil
@@ -288,7 +288,7 @@ func (s *Server) listenTCP(pm PortMap) error {
 			}
 			tuneTCP(c, &s.cfg.Common)
 			go func() {
-				t, err := s.open(protoTCP, pm.Target)
+				t, err := s.open(protoTCP, pm.Target, c.RemoteAddr().String())
 				if err != nil {
 					logf("warn", "%s: %v", pm.Listen, err)
 					c.Close()
@@ -349,7 +349,7 @@ func (s *Server) listenUDP(pm PortMap) error {
 			mu.Lock()
 			p := peers[key]
 			if p == nil {
-				t, err := s.open(protoUDP, pm.Target)
+				t, err := s.open(protoUDP, pm.Target, key)
 				if err != nil {
 					mu.Unlock()
 					logf("warn", "udp %s: %v", pm.Listen, err)

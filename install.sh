@@ -97,6 +97,14 @@ EOF
 
 valid_name() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
 
+# ask_yn "prompt" <default y|n> -> returns 0 (yes) / 1 (no)
+ask_yn() {
+  local p=$1 d=$2 a
+  read -rp "$p " a
+  a=${a:-$d}
+  [[ "${a,,}" == y* ]]
+}
+
 # ---------- create tunnel ----------
 do_create() {
   ensure_installed
@@ -115,9 +123,10 @@ do_create() {
   local f="$CFGDIR/$name.toml" token
   case "$kind" in
     1) # reverse server
-      local tr bind
+      local tr bind enc
       tr=$(pick_transport)
       read -rp "tunnel bind port [3080]: " bind; bind=${bind:-3080}
+      enc=$(ask_yn "encrypt the tunnel (AES-256-GCM)? [Y/n]:" y && echo true || echo false)
       token="$(gen_token)"
       say "generated token (put the SAME token on the client):"
       say "  ${C_CYN}$token${C_RESET}"
@@ -132,6 +141,7 @@ do_create() {
         echo "bind_addr = \"0.0.0.0:$bind\""
         echo "transport = \"$tr\""
         echo "token = \"$token\""
+        echo "encryption = $enc"
         echo "heartbeat = 20"
         echo "web_port = 2060"
         echo "log_level = \"info\""
@@ -142,16 +152,29 @@ do_create() {
       } > "$f"
       ;;
     2) # reverse client
-      local tr remote pool
+      local tr remote pool enc proxy
       tr=$(pick_transport)
       read -rp "server address (IRAN_IP:PORT): " remote
       read -rp "token (from the server): " token
       read -rp "connection_pool [8]: " pool; pool=${pool:-8}
+      enc=$(ask_yn "encrypt the tunnel (must match the server)? [Y/n]:" y && echo true || echo false)
+      proxy=$(ask_yn "send PROXY protocol v2 to the backend (real client IP)? [y/N]:" n && echo true || echo false)
+      say "backup server addresses (optional, one per line, empty to finish):"
+      local backups=() bl
+      while true; do read -rp "  backup> " bl; [ -z "$bl" ] && break; backups+=("$bl"); done
       {
         echo "[client]"
         echo "remote_addr = \"$remote\""
+        if [ ${#backups[@]} -gt 0 ]; then
+          printf 'remote_addrs = ['
+          local first=1 b
+          for b in "${backups[@]}"; do [ $first -eq 1 ] && first=0 || printf ', '; printf '"%s"' "$b"; done
+          echo "]"
+        fi
         echo "transport = \"$tr\""
         echo "token = \"$token\""
+        echo "encryption = $enc"
+        echo "proxy_protocol = $proxy"
         echo "connection_pool = $pool"
         echo "heartbeat = 20"
         echo "web_port = 2061"

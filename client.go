@@ -41,11 +41,12 @@ func (c *Client) connect(ctx context.Context, kind byte) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := clientHandshake(conn, c.cfg.Token, kind); err != nil {
+	wrapped, err := clientHandshake(conn, c.cfg.Token, kind, c.cfg.Encryption)
+	if err != nil {
 		conn.Close()
 		return nil, err
 	}
-	return conn, nil
+	return wrapped, nil
 }
 
 // ---- mux mode ----
@@ -59,13 +60,13 @@ func (c *Client) muxLoop(i int) {
 			continue
 		}
 		sess := NewSession(conn, c.cfg.MuxFrameSize, c.cfg.MuxWindow, c.cfg.Heartbeat)
-		logf("info", "mux #%d connected to %s", i, c.cfg.RemoteAddr)
+		logf("info", "mux #%d connected to %s", i, conn.RemoteAddr())
 		for {
 			st, err := sess.Accept()
 			if err != nil {
 				break
 			}
-			go c.handle(st, st.openProto, st.openAddr)
+			go c.handle(st, st.openProto, st.openAddr, st.openSrc)
 		}
 		sess.Close()
 		logf("warn", "mux #%d disconnected", i)
@@ -93,7 +94,7 @@ func (c *Client) controlLoop() {
 				hb = time.Duration(v) * time.Second
 			}
 		}
-		logf("info", "connected to %s (pool=%d, heartbeat=%v)", c.cfg.RemoteAddr, c.cfg.ConnectionPool, hb)
+		logf("info", "connected to %s (pool=%d, heartbeat=%v)", ctl.RemoteAddr(), c.cfg.ConnectionPool, hb)
 
 		for i := 0; i < c.cfg.ConnectionPool; i++ {
 			go c.dataWorker(ctx, hb, true)
@@ -147,7 +148,7 @@ func (c *Client) dataWorker(ctx context.Context, hb time.Duration, persistent bo
 			continue
 		}
 		stop := context.AfterFunc(ctx, func() { conn.Close() })
-		proto, addr, err := waitHeader(conn, hb)
+		proto, addr, src, err := waitHeader(conn, hb)
 		if !stop() || err != nil { // ctx cancelled or conn died while idle
 			conn.Close()
 			if !persistent {
@@ -155,40 +156,49 @@ func (c *Client) dataWorker(ctx context.Context, hb time.Duration, persistent bo
 			}
 			continue
 		}
-		go c.handle(conn, proto, addr)
+		go c.handle(conn, proto, addr, src)
 		if !persistent {
 			return
 		}
 	}
 }
 
-func waitHeader(conn net.Conn, hb time.Duration) (byte, string, error) {
+func waitHeader(conn net.Conn, hb time.Duration) (proto byte, target, src string, err error) {
 	defer conn.SetReadDeadline(time.Time{})
 	b := make([]byte, 1)
 	for {
 		conn.SetReadDeadline(time.Now().Add(3 * hb))
-		if _, err := io.ReadFull(conn, b); err != nil {
-			return 0, "", err
+		if _, err = io.ReadFull(conn, b); err != nil {
+			return
 		}
 		if b[0] != protoPing {
 			break
 		}
 	}
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	proto := b[0]
-	if _, err := io.ReadFull(conn, b); err != nil {
-		return 0, "", err
+	proto = b[0]
+	readStr := func() (string, error) {
+		if _, e := io.ReadFull(conn, b); e != nil {
+			return "", e
+		}
+		a := make([]byte, b[0])
+		if _, e := io.ReadFull(conn, a); e != nil {
+			return "", e
+		}
+		return string(a), nil
 	}
-	a := make([]byte, b[0])
-	if _, err := io.ReadFull(conn, a); err != nil {
-		return 0, "", err
+	if target, err = readStr(); err != nil {
+		return
 	}
-	return proto, string(a), nil
+	if src, err = readStr(); err != nil {
+		return
+	}
+	return proto, target, src, nil
 }
 
 // ---- forwarding to the real service ----
 
-func (c *Client) handle(t io.ReadWriteCloser, proto byte, addr string) {
+func (c *Client) handle(t io.ReadWriteCloser, proto byte, addr, src string) {
 	switch proto {
 	case protoTCP:
 		dst, err := net.DialTimeout("tcp", addr, c.cfg.DialTimeout)
@@ -198,6 +208,16 @@ func (c *Client) handle(t io.ReadWriteCloser, proto byte, addr string) {
 			return
 		}
 		tuneTCP(dst, &c.cfg.Common)
+		if c.cfg.ProxyProtocol && src != "" {
+			if hdr := buildProxyV2(src, addr); hdr != nil {
+				if _, err := dst.Write(hdr); err != nil {
+					logf("warn", "proxy-protocol write %s: %v", addr, err)
+					dst.Close()
+					t.Close()
+					return
+				}
+			}
+		}
 		pipe(t, dst, c.stats.Get(addr+"/tcp"))
 	case protoUDP:
 		c.handleUDP(t, addr)

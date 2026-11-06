@@ -117,7 +117,7 @@ func (s *Session) writeFrame(cmd byte, id uint32, p []byte) error {
 }
 
 // Open creates a new stream and sends SYN carrying the open header.
-func (s *Session) Open(proto byte, addr string) (*Stream, error) {
+func (s *Session) Open(proto byte, target, src string) (*Stream, error) {
 	s.mu.Lock()
 	if s.IsClosed() {
 		s.mu.Unlock()
@@ -129,8 +129,7 @@ func (s *Session) Open(proto byte, addr string) (*Stream, error) {
 	s.streams[id] = st
 	s.mu.Unlock()
 
-	hdr := append([]byte{proto, byte(len(addr))}, addr...)
-	if err := s.writeFrame(cmdSYN, id, hdr); err != nil {
+	if err := s.writeFrame(cmdSYN, id, encodeOpen(proto, target, src)); err != nil {
 		return nil, err
 	}
 	st.grantExtra()
@@ -188,11 +187,12 @@ func (s *Session) recvLoop() {
 			go s.writeFrame(cmdPONG, 0, nil)
 		case cmdPONG:
 		case cmdSYN:
-			if len(p) < 2 || int(p[1])+2 != len(p) {
+			proto, target, src, ok := decodeOpen(p)
+			if !ok {
 				return
 			}
 			st := newStream(s, id)
-			st.openProto, st.openAddr = p[0], string(p[2:])
+			st.openProto, st.openAddr, st.openSrc = proto, target, src
 			s.mu.Lock()
 			s.streams[id] = st
 			s.mu.Unlock()
@@ -243,6 +243,7 @@ type Stream struct {
 
 	openProto byte
 	openAddr  string
+	openSrc   string
 
 	mu       sync.Mutex
 	cond     *sync.Cond

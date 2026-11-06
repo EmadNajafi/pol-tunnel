@@ -83,17 +83,24 @@ func freePort(t *testing.T) int {
 func TestEndToEnd(t *testing.T) {
 	setLogLevel("warn")
 	for _, tr := range []string{"tcp", "tcpmux", "ws", "wsmux", "wss", "wssmux", "spoof", "spoofmux"} {
-		t.Run(tr, func(t *testing.T) { runE2E(t, tr) })
+		for _, enc := range []bool{false, true} {
+			name := tr
+			if enc {
+				name += "+enc"
+			}
+			t.Run(name, func(t *testing.T) { runE2E(t, tr, enc) })
+		}
 	}
 }
 
-func runE2E(t *testing.T, transport string) {
+func runE2E(t *testing.T, transport string, encrypt bool) {
 	tcpTarget, udpTarget := echoTCP(t), echoUDP(t)
 	tunnelPort, pubTCP, pubUDP := freePort(t), freePort(t), freePort(t)
 	common := defaultCommon()
 	common.Transport = transport
 	common.Token = "test-token"
 	common.Heartbeat = 2 * time.Second
+	common.Encryption = encrypt
 
 	sc := &ServerConfig{Common: common, BindAddr: fmt.Sprintf("127.0.0.1:%d", tunnelPort), AcceptUDP: true,
 		Ports: []string{fmt.Sprintf("127.0.0.1:%d=%s", pubTCP, tcpTarget)}}
@@ -172,7 +179,7 @@ func runE2E(t *testing.T, transport string) {
 	bad.Token = "wrong"
 	conn, err := NewDialer(&bad)(context.Background())
 	if err == nil {
-		if clientHandshake(conn, bad.Token, connControl) == nil {
+		if _, herr := clientHandshake(conn, bad.Token, connControl, false); herr == nil {
 			t.Error("wrong token accepted")
 		}
 		conn.Close()

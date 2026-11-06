@@ -1,8 +1,11 @@
 # Kharej side (client). Dials out to the Iran server; needs no open inbound port.
 [client]
 remote_addr = "IRAN_IP:3080"
+# remote_addrs = ["BACKUP_IP:3080"]  # optional backup servers; auto-failover
 transport = "tcpmux"          # must match the server
 token = "CHANGE_ME"
+encryption = true             # must match the server
+# proxy_protocol = true       # send the real visitor IP to the backend (PROXY v2)
 connection_pool = 8           # idle data conns (tcp/ws) or mux sessions (*mux)
 retry_interval = 3
 dial_timeout = 10

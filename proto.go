@@ -47,80 +47,178 @@ const (
 	ctlConfig    byte = 3 // S -> C, first message: uint16 heartbeat seconds
 )
 
-var magic = []byte("POL1")
+var magic = []byte("POL2")
 
 var errAuth = errors.New("authentication failed")
 
-func mac(token, label string, nonce []byte, kind byte) []byte {
+const encFlag = 0x01 // bit0 in the flags byte: this side wants encryption
+
+// hsMac binds the whole handshake transcript (nonce, kind, both flag bytes,
+// both ephemeral public keys) so a MITM cannot alter any of it without the token.
+func hsMac(token, label string, nonce []byte, kind, sFlags, cFlags byte, sPub, cPub []byte) []byte {
 	h := hmac.New(sha256.New, []byte(token))
 	h.Write([]byte(label))
 	h.Write(nonce)
-	h.Write([]byte{kind})
+	h.Write([]byte{kind, sFlags, cFlags})
+	h.Write(sPub)
+	h.Write(cPub)
 	return h.Sum(nil)
 }
 
-// serverHandshake authenticates an incoming transport connection and returns its kind.
-func serverHandshake(c net.Conn, token string) (byte, error) {
+// Handshake (POL2), on every transport connection:
+//
+//	S->C : "POL2" | sFlags[1] | sEphPub[32] | nonce[32]
+//	C->S : kind[1] | cFlags[1] | cEphPub[32] | HMAC(token, "pol-c" | transcript)
+//	S->C : HMAC(token, "pol-s" | transcript)
+//
+// The token is proven both ways without crossing the wire. When both flags set
+// encFlag, the two ephemeral X25519 keys yield a session key (forward secrecy)
+// and the returned conn is wrapped in AES-256-GCM. A wrong token => the server
+// stays silent and closes, so probes learn nothing.
+
+// serverHandshake authenticates an incoming connection, negotiates encryption,
+// and returns its kind plus the conn to use (AEAD-wrapped if negotiated).
+func serverHandshake(c net.Conn, token string, encrypt bool) (byte, net.Conn, error) {
 	c.SetDeadline(time.Now().Add(10 * time.Second))
 	defer c.SetDeadline(time.Time{})
+	eph, err := genEphemeral()
+	if err != nil {
+		return 0, nil, err
+	}
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	if _, err := c.Write(append(append([]byte{}, magic...), nonce...)); err != nil {
-		return 0, err
+	sFlags := byte(0)
+	if encrypt {
+		sFlags |= encFlag
 	}
-	buf := make([]byte, 33)
+	sPub := eph.PublicKey().Bytes()
+	msg := append([]byte{}, magic...)
+	msg = append(msg, sFlags)
+	msg = append(msg, sPub...)
+	msg = append(msg, nonce...)
+	if _, err := c.Write(msg); err != nil {
+		return 0, nil, err
+	}
+	buf := make([]byte, 1+1+32+32)
 	if _, err := io.ReadFull(c, buf); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	kind := buf[0]
-	if !hmac.Equal(buf[1:], mac(token, "pol-c", nonce, kind)) || kind < connControl || kind > connMux {
-		return 0, errAuth
+	kind, cFlags, cPub, gotMac := buf[0], buf[1], buf[2:34], buf[34:]
+	want := hsMac(token, "pol-c", nonce, kind, sFlags, cFlags, sPub, cPub)
+	if !hmac.Equal(gotMac, want) || kind < connControl || kind > connMux {
+		return 0, nil, errAuth
 	}
-	if _, err := c.Write(mac(token, "pol-s", nonce, kind)); err != nil {
-		return 0, err
+	if _, err := c.Write(hsMac(token, "pol-s", nonce, kind, sFlags, cFlags, sPub, cPub)); err != nil {
+		return 0, nil, err
 	}
-	return kind, nil
+	conn := c
+	if sFlags&encFlag != 0 && cFlags&encFlag != 0 {
+		ss, err := sharedSecret(eph, cPub)
+		if err != nil {
+			return 0, nil, err
+		}
+		keys, err := deriveKeys(token, ss, false) // server = responder
+		if err != nil {
+			return 0, nil, err
+		}
+		conn = newAEADConn(c, keys)
+	}
+	return kind, conn, nil
 }
 
-func clientHandshake(c net.Conn, token string, kind byte) error {
+func clientHandshake(c net.Conn, token string, kind byte, encrypt bool) (net.Conn, error) {
 	c.SetDeadline(time.Now().Add(10 * time.Second))
 	defer c.SetDeadline(time.Time{})
-	hello := make([]byte, 36)
+	eph, err := genEphemeral()
+	if err != nil {
+		return nil, err
+	}
+	hello := make([]byte, 4+1+32+32)
 	if _, err := io.ReadFull(c, hello); err != nil {
-		return fmt.Errorf("handshake: %w", err)
+		return nil, fmt.Errorf("handshake: %w", err)
 	}
 	if string(hello[:4]) != string(magic) {
-		return errors.New("handshake: not a pol server")
+		return nil, errors.New("handshake: not a pol server (version mismatch?)")
 	}
-	nonce := hello[4:]
-	if _, err := c.Write(append([]byte{kind}, mac(token, "pol-c", nonce, kind)...)); err != nil {
-		return err
+	sFlags, sPub, nonce := hello[4], hello[5:37], hello[37:69]
+	cFlags := byte(0)
+	if encrypt {
+		cFlags |= encFlag
+	}
+	cPub := eph.PublicKey().Bytes()
+	out := []byte{kind, cFlags}
+	out = append(out, cPub...)
+	out = append(out, hsMac(token, "pol-c", nonce, kind, sFlags, cFlags, sPub, cPub)...)
+	if _, err := c.Write(out); err != nil {
+		return nil, err
 	}
 	proof := make([]byte, 32)
 	if _, err := io.ReadFull(c, proof); err != nil {
-		return fmt.Errorf("handshake rejected (wrong token?): %w", err)
+		return nil, fmt.Errorf("handshake rejected (wrong token?): %w", err)
 	}
-	if !hmac.Equal(proof, mac(token, "pol-s", nonce, kind)) {
-		return errors.New("handshake: server failed to prove the token")
+	if !hmac.Equal(proof, hsMac(token, "pol-s", nonce, kind, sFlags, cFlags, sPub, cPub)) {
+		return nil, errors.New("handshake: server failed to prove the token")
 	}
-	return nil
+	conn := c
+	if sFlags&encFlag != 0 && cFlags&encFlag != 0 {
+		ss, err := sharedSecret(eph, sPub)
+		if err != nil {
+			return nil, err
+		}
+		keys, err := deriveKeys(token, ss, true) // client = initiator
+		if err != nil {
+			return nil, err
+		}
+		conn = newAEADConn(c, keys)
+	}
+	return conn, nil
 }
 
-func writeOpenHeader(w io.Writer, proto byte, addr string) error {
-	if len(addr) > 255 {
-		return errors.New("target address too long")
+// encodeOpen is the open header body (used by both pooled data conns and mux
+// SYN frames):  proto[1] | tlen[1] | target | slen[1] | src
+// src is the visitor's address (for PROXY protocol); it may be empty.
+func encodeOpen(proto byte, target, src string) []byte {
+	if len(target) > 255 {
+		target = target[:255]
 	}
-	b := make([]byte, 0, 2+len(addr))
-	b = append(b, proto, byte(len(addr)))
-	b = append(b, addr...)
-	_, err := w.Write(b)
+	if len(src) > 255 {
+		src = src[:255]
+	}
+	b := make([]byte, 0, 3+len(target)+len(src))
+	b = append(b, proto, byte(len(target)))
+	b = append(b, target...)
+	b = append(b, byte(len(src)))
+	b = append(b, src...)
+	return b
+}
+
+func decodeOpen(p []byte) (proto byte, target, src string, ok bool) {
+	if len(p) < 2 {
+		return
+	}
+	proto = p[0]
+	tl := int(p[1])
+	if 2+tl+1 > len(p) {
+		return
+	}
+	target = string(p[2 : 2+tl])
+	sl := int(p[2+tl])
+	if 2+tl+1+sl != len(p) {
+		return
+	}
+	src = string(p[3+tl : 3+tl+sl])
+	return proto, target, src, true
+}
+
+func writeOpenHeader(w io.Writer, proto byte, target, src string) error {
+	_, err := w.Write(encodeOpen(proto, target, src))
 	return err
 }
 
-// readOpenHeader reads the open header, skipping ping bytes.
-func readOpenHeader(r io.Reader) (proto byte, addr string, err error) {
+// readOpenHeader reads a pooled-conn open header, skipping leading ping bytes.
+func readOpenHeader(r io.Reader) (proto byte, target, src string, err error) {
 	one := make([]byte, 1)
 	for {
 		if _, err = io.ReadFull(r, one); err != nil {
@@ -132,16 +230,25 @@ func readOpenHeader(r io.Reader) (proto byte, addr string, err error) {
 	}
 	proto = one[0]
 	if proto != protoTCP && proto != protoUDP {
-		return 0, "", fmt.Errorf("bad proto byte %d", proto)
+		return 0, "", "", fmt.Errorf("bad proto byte %d", proto)
 	}
-	if _, err = io.ReadFull(r, one); err != nil {
+	readStr := func() (string, error) {
+		if _, e := io.ReadFull(r, one); e != nil {
+			return "", e
+		}
+		a := make([]byte, one[0])
+		if _, e := io.ReadFull(r, a); e != nil {
+			return "", e
+		}
+		return string(a), nil
+	}
+	if target, err = readStr(); err != nil {
 		return
 	}
-	a := make([]byte, one[0])
-	if _, err = io.ReadFull(r, a); err != nil {
+	if src, err = readStr(); err != nil {
 		return
 	}
-	return proto, string(a), nil
+	return proto, target, src, nil
 }
 
 // UDP datagrams over a stream: len[2] | payload
