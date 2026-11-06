@@ -40,17 +40,40 @@ gen_token() {
 
 # ---------- install / update ----------
 do_install() {
-  local arch url tmp
+  local arch base url tmp sums want got
   arch="$(detect_arch)"
-  url="https://github.com/$REPO/releases/${VERSION_TAG}/download/pol-linux-$arch"
-  [ "$VERSION_TAG" = latest ] && url="https://github.com/$REPO/releases/latest/download/pol-linux-$arch"
+  if [ "$VERSION_TAG" = latest ]; then
+    base="https://github.com/$REPO/releases/latest/download"
+  else
+    base="https://github.com/$REPO/releases/download/$VERSION_TAG"
+  fi
+  url="$base/pol-linux-$arch"
   say "downloading pol ($arch) ..."
-  tmp="$(mktemp)"
+  # temp file next to the target: same filesystem, and not on a noexec /tmp
+  tmp="$(mktemp "$BIN.XXXXXX")"; sums="$(mktemp)"
   if ! curl -fsSL "$url" -o "$tmp"; then
     err "download failed from $url"
+    rm -f "$tmp" "$sums"; return 1
+  fi
+  # verify against the release's SHA256SUMS (catches truncated/corrupted downloads)
+  if curl -fsSL "$base/SHA256SUMS" -o "$sums" 2>/dev/null && [ -s "$sums" ]; then
+    want="$(awk -v f="pol-linux-$arch" '$2==f || $2=="*"f {print $1}' "$sums")"
+    got="$(sha256sum "$tmp" | awk '{print $1}')"
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then
+      err "checksum mismatch for pol-linux-$arch (expected ${want:-none}, got $got) — not installing"
+      rm -f "$tmp" "$sums"; return 1
+    fi
+    ok "checksum verified"
+  else
+    warn "this release has no SHA256SUMS; skipping checksum verification"
+  fi
+  rm -f "$sums"
+  chmod 0755 "$tmp"
+  if ! "$tmp" -version >/dev/null 2>&1; then
+    err "downloaded file is not a working pol binary — not installing"
     rm -f "$tmp"; return 1
   fi
-  install -m 0755 "$tmp" "$BIN"; rm -f "$tmp"
+  mv -f "$tmp" "$BIN"   # atomic replace, safe while a service runs the old one
   mkdir -p "$CFGDIR"
   ok "installed $("$BIN" -version) at $BIN"
   # install this manager as the `poltunnel` command (atomic replace so it is
@@ -291,7 +314,7 @@ do_conntest() {
   local c; read -rp "choice [2]: " c; c=${c:-2}
   case "$c" in
     1) local p; read -rp "agent control port [46000]: " p; p=${p:-46000}
-       say "agent up on :$p — now run option 2 on the other server; Ctrl-C here when done"
+       say "agent up on :$p — now run option 2 on the other server and give it the test key printed below; Ctrl-C here when done"
        "$BIN" -test-agent ":$p" ;;
     2) local a; read -rp "agent address (HOST_SERVER_IP:46000): " a
        [ -z "$a" ] && { err "no address"; return 1; }
