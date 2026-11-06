@@ -57,7 +57,7 @@ UDP روی stream:  len[2] | datagram
 **نصب سریع با منوی تعاملی** (مثل Backhaul/BackPack — نصب، ساخت تونل، start/stop/status، همه با منو):
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/EmadNajafi/pol-tunnel/main/install.sh)
+curl -fsSL https://raw.githubusercontent.com/EmadNajafi/pol-tunnel/main/install.sh | sudo bash
 ```
 
 بعد از نصب، هر وقت خواستی منو را باز کنی فقط کافی است بزنی:
