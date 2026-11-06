@@ -78,24 +78,42 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o pol
 ./pol -c client.toml      # روی سرور خارج
 ```
 
-**تست زنده‌ی همه‌ی تانل‌ها بین دو سرور** (هر تانل واقعی — ۶ ریورس + spoof/spoofmux + direct — را عملاً بالا می‌آورد، لایو روی هر دو سرور نشان می‌دهد، و آخر می‌گوید کدام‌ها اجرا می‌شوند؛ در منو: گزینه «Test tunnels»):
+### Connection Test — کدام تانل‌ها بین این دو سرور واقعاً کار می‌کنند
 
-```bash
-# روی سروری که میزبان تانل می‌شود (مثلاً ایران):
-./pol -test-agent :46000          # یک «test key» چاپ می‌کند
-# روی سرور دیگر:
-./pol -test-run HOST_IP:46000     # test key را می‌پرسد (یا: -test-key KEY)
+اینکه یک ترنسپورت بین دو سرور مشخص کار می‌کند یا نه، به **مسیر** بستگی دارد نه به برنامه: بعضی مسیرها هر اتصال جدید را بعد از چند پکت قطع می‌کنند، بعضی UDP را می‌بندند، بعضی TLS را ریست می‌کنند. تنها راه مطمئن این است که هر تانل را واقعاً روی مسیر اجرا کنی — Connection Test همین کار را می‌کند (مثل گزینه‌ی Connection Test در بک‌پک):
+
+1. **روی سرور ایران** (منو ← `6) Connection Test` ← `Iran`، یا مستقیم):
+   ```bash
+   sudo pol -conntest                      # آدرس عمومی خودکار؛ یا: -conntest-host PUBLIC_IP
+   ```
+   برای **هر ترنسپورت** (tcp, tcpmux, ws, wsmux, wss, wssmux, spoof, spoofmux) و **تانل direct (L3)** یک موتور واقعی pol روی پورت آزاد بالا می‌آید و یک **لینک کوتاه** چاپ می‌شود، مثل `pol://t.AV2DoBhODzOj-SbrzyNqCmMAAQ`.
+2. **روی سرور خارج** (منو ← `Kharej` ← لینک را paste کن، یا):
+   ```bash
+   sudo pol -conntest-join 'pol://t....'
+   ```
+   تنظیمات تست را از ایران می‌گیرد، سمت خودش همه‌ی تانل‌ها و یک سرویس echo را بالا می‌آورد.
+3. سرور ایران از **همه‌ی تانل‌ها هم‌زمان** ترافیک رد می‌کند: **هر ثانیه یک echo به مدت یک دقیقه** روی همان اتصال (همان چیزی که کاربر واقعی می‌بیند)، بعد روی تانل‌هایی که همه را رساندند **سرعت دانلود و آپلود** (۴ stream، فقط بایت‌هایی که گیرنده تأیید کرده). اگر هر دو طرف root باشند، **جعل IP** هم در هر دو جهت (ایران→خارج و خارج→ایران) با منبع `10.10.10.10` بررسی می‌شود.
+4. هر دو سرور جدول زنده و در پایان **حکم** را نشان می‌دهند: 🟢 **OK** (همه‌ی echoها رسید)، 🟡 **UNSTABLE** (افت داشت — با زمان اولین قطعی)، 🔴 **DOWN** (اصلاً بالا نیامد یا هیچ چیزی رد نکرد)، ⚪ **SKIPPED** (با دلیل). بعد لیست «Works steadily» با RTT و سرعت، توضیح هر خطا، و جدول **BEST SETTINGS** (ترنسپورت پیشنهادی، `mux_window` بر اساس سرعت×RTT، `heartbeat` و `keepalive_period` بر اساس RTT/افت).
+5. **هیچ چیزی باقی نمی‌ماند**: موتورها، کانفیگ‌های موقت و اینترفیس‌های تست بعد از پایان (یا Ctrl+C) پاک می‌شوند.
+
 ```
-اتصال کنترلی با این کلید احراز هویت می‌شود (کلید روی سیم نمی‌رود) و توکن تانل‌های تست هم از آن مشتق می‌شود؛ پس کسی که فقط به پورت agent دسترسی دارد نمی‌تواند آن را کنترل کند. همه‌ی ورودی‌ها (ترنسپورت، پورت، IP) هم اعتبارسنجی می‌شوند.
-خروجی سمت runner:
+VERDICT — Iran ⇄ kharej
+RESULT   KIND      NAME         STATUS    ECHOES  PROGRESS
+
+🟢       Reverse   TCP          OK        60/60   ▰▰▰▰▰▰▰▰ 100%
+🟢       Reverse   TCP MUX      OK        60/60   ▰▰▰▰▰▰▰▰ 100%
+🟡       Reverse   WS           UNSTABLE  54/60   ▰▰▰▰▰▰▰▱  90%
+🔴       Reverse   SPOOF (UDP)  DOWN      0/60    ▱▱▱▱▱▱▱▱   0%
+🔴       Direct    L3 / UDP     DOWN      0/60    ▱▱▱▱▱▱▱▱   0%
+...
+Notes:
+🟡 Reverse WS: 54 of 60 echoes came back; first loss after 12s
+🔴 Reverse SPOOF (UDP): never carried traffic in 1m0s — UDP looks blocked or throttled on this path
 ```
-  testing tcp       ... ✓
-  testing tcpmux    ... ✓
-  ...
-  testing direct    ... ✓
-── which tunnels run on these two servers ──
-usable: tcp, tcpmux, ws, wsmux, wss, wssmux, spoof, spoofmux, direct
-```
+
+- لینک فقط آدرس coordinator و یک راز ۱۲ بایتی را دارد؛ توکن هر تانل از آن مشتق می‌شود و هر سؤال به coordinator با HMAC روی یک nonce تازه احراز می‌شود، پس کسی که لینک را ندارد نمی‌تواند در تست دخالت کند.
+- تانل direct و چک جعل IP به **root روی لینوکس در هر دو سرور** نیاز دارند؛ بدون آن SKIPPED می‌شوند (`-conntest-direct=false` / `-conntest-spoof=false` برای حذف عمدی).
+- پورت‌ها تصادفی‌اند (۲۰۰۰۰ تا ۳۲۰۰۰)؛ فایروال سرور ایران باید ورودی روی این بازه را اجازه دهد.
 
 **لینک‌تست سریع بین دو سرور** (به سبک Link Test بک‌پک — تأخیر/jitter/loss + پیشنهاد):
 
@@ -243,6 +261,8 @@ sudo ./pol -c direct-client.toml   # روی سرور دیگر
 | `spoof.go` | ترنسپورت spoof: demux بر اساس connID، listener/dialer |
 | `rawsend_linux.go` / `rawsend_other.go` | ارسال با IP مبدأ جعلی (raw socket، فقط لینوکس) |
 | `direct.go` / `direct_crypto.go` | حالت دایرکت L3: موتور تونل، دست‌دادن X25519 و AES-GCM |
+| `conntest.go` / `conntestboard.go` | Connection Test: اجرای واقعی همه‌ی تانل‌ها بین دو سرور، coordinator، echo/سرعت، جدول زنده و حکم |
+| `probe.go` | Link Test: تأخیر/jitter/افت روی TCP و UDP، چک جعل IP، پیشنهاد ترنسپورت |
 | `tun_linux.go` / `tun_other.go` | اینترفیس TUN لایه‌۳ (فقط لینوکس) |
 | `mux.go` | مالتی‌پلکسر با flow control و half-close |
 | `websocket.go` | پیاده‌سازی مینیمال RFC 6455 (کلاینت و سرور) |

@@ -18,9 +18,11 @@ func main() {
 	probeListen := flag.String("probe-listen", "", "link test: listen on this addr (run on one server)")
 	probe := flag.String("probe", "", "link test: measure the path to this HOST:PORT (run on the other server)")
 	spoofSrc := flag.String("spoof-src", "192.0.2.123", "forged source IP used by the -probe spoof test")
-	testAgent := flag.String("test-agent", "", "live tunnel test: run the agent on this addr (the tunnel-host server)")
-	testRun := flag.String("test-run", "", "live tunnel test: run every tunnel against the agent at HOST:PORT (other server)")
-	testKey := flag.String("test-key", "", "live tunnel test: the key printed by -test-agent (asked for if omitted)")
+	connTest := flag.Bool("conntest", false, "connection test, Iran side: start every tunnel and print a link for the kharej")
+	connTestHost := flag.String("conntest-host", "", "connection test: this server's public address for the link (auto-detected)")
+	connTestDirect := flag.Bool("conntest-direct", true, "connection test: include the direct (L3) tunnel (root + Linux on both)")
+	connTestSpoof := flag.Bool("conntest-spoof", true, "connection test: include the IP-spoofing check (root + Linux on both)")
+	connTestJoin := flag.String("conntest-join", "", "connection test, kharej side: join the test with the link Iran printed")
 	flag.Parse()
 
 	if *showVer {
@@ -45,15 +47,15 @@ func main() {
 		}
 		return
 	}
-	if *testAgent != "" {
-		if err := runTestAgent(*testAgent); err != nil {
-			log.Fatalf("test-agent: %v", err)
+	if *connTest {
+		if err := runConnTestIran(*connTestHost, *connTestDirect, *connTestSpoof); err != nil {
+			log.Fatalf("connection test: %v", err)
 		}
 		return
 	}
-	if *testRun != "" {
-		if err := runTestRun(*testRun, *testKey); err != nil {
-			log.Fatalf("test-run: %v", err)
+	if *connTestJoin != "" {
+		if err := runConnTestKharej(*connTestJoin); err != nil {
+			log.Fatalf("connection test: %v", err)
 		}
 		return
 	}
