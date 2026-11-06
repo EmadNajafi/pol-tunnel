@@ -76,7 +76,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o pol
 ./pol -c client.toml      # روی سرور خارج
 ```
 
-**تست کانکشن بین دو سرور** (می‌گوید چه تانل‌هایی ساختنی است — در منو هم هست: گزینه «Test connectivity»):
+**لینک‌تست بین دو سرور** (به سبک Link Test بک‌پک — در منو هم هست: گزینه «Test connectivity»):
 
 ```bash
 # روی سروری که میزبان تانل می‌شود (ایران):
@@ -84,7 +84,18 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o pol
 # روی سرور دیگر (خارج):
 ./pol -probe IRAN_IP:7000
 ```
-خروجی: دسترسی TCP و UDP (با تأخیر و درصد گم‌شدن) و امکان جعل‌IP را می‌سنجد و فهرست ترنسپورت‌های قابل‌ساخت را چاپ می‌کند.
+روی TCP و UDP **تأخیر، jitter و packet loss** را می‌سنجد، بررسی می‌کند دیتاسنتر اجازه‌ی **جعل IP** می‌دهد یا نه، و بر اساس کیفیت مسیر **ترنسپورت مناسب را پیشنهاد می‌دهد**:
+
+```
+── link test ───────────────────────────────
+  TCP    ✓  latency 89.9 ms   jitter 2.1 ms   loss 0%
+  UDP    ✓  latency 96.5 ms   jitter 2.3 ms   loss 0%
+  SPOOF  ✗  datacenter filters forged source (BCP38)
+────────────────────────────────────────────
+recommendation:
+  → tcpmux     (clean, low-latency route — simplest and efficient)
+  + add  encryption = true  on both ends for an encrypted tunnel
+```
 
 نمونه کانفیگ‌ها در [examples/server.toml](examples/server.toml) و [examples/client.toml](examples/client.toml) هستند.
 توکن و `transport` باید در هر دو طرف یکی باشند.

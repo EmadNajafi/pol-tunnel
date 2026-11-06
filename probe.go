@@ -3,26 +3,25 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"net"
 	"strings"
 	"sync"
 	"time"
 )
 
-// Connectivity probe: a listener on one server and a tester on the other decide
-// which transports the network path between them actually allows. It measures
-// TCP reachability + latency, UDP reachability + loss, and whether the tester's
-// datacenter lets it send packets with a forged source IP (BCP38).
-//
-// A TCP control connection carries the test commands; UDP datagrams carry the
-// data probes. The listener reports what it received back over the control link.
+// Link test (BackPack-style): a listener on one server and a tester on the other
+// measure the route — latency, jitter and packet loss over both TCP and UDP —
+// check whether the datacenter allows a forged source IP, and recommend a
+// transport. A TCP control connection carries PING/PONG and the UDP-arrival
+// counts; UDP datagrams carry the data probes (the listener echoes them back).
 
 // ---- listener ----
 
 type probeListener struct {
-	mu    sync.Mutex
-	seen  map[string]int    // tag -> datagrams received
-	src   map[string]string // tag -> last observed source IP
+	mu   sync.Mutex
+	seen map[string]int
+	src  map[string]string
 }
 
 func runProbeListen(addr string) error {
@@ -50,13 +49,16 @@ func runProbeListen(addr string) error {
 			pl.seen[tag]++
 			pl.src[tag] = from.IP.String()
 			pl.mu.Unlock()
+			// echo back (for the UDP latency/loss test); spoofed packets' echoes
+			// go to the forged source and are lost — those use the COUNT path.
+			uc.WriteToUDP(buf[:n], from)
 		}
 	}()
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("probe listener up on %s (tcp+udp). Run the tester on the other server; Ctrl-C when done.\n", addr)
+	fmt.Printf("link-test listener up on %s (tcp+udp). Run the test on the other server; Ctrl-C when done.\n", addr)
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -97,16 +99,24 @@ func (pl *probeListener) handle(c net.Conn) {
 
 // ---- tester ----
 
+type linkStats struct {
+	ok       bool
+	sent     int
+	recv     int
+	avgMS    float64
+	jitterMS float64
+	lossPct  int
+}
+
 type probeResult struct {
-	tcpOK         bool
-	tcpRTT        time.Duration
-	udpOK         bool
-	udpLoss       int // percent
-	udpRTTnote    string
+	tcp           linkStats
+	udp           linkStats
 	spoofTested   bool
 	spoofOK       bool
 	spoofSeenFrom string
 }
+
+const probeSamples = 30
 
 func runProbe(peer, spoofSrc string) error {
 	host, port, err := net.SplitHostPort(peer)
@@ -114,125 +124,184 @@ func runProbe(peer, spoofSrc string) error {
 		return fmt.Errorf("peer must be HOST:PORT: %w", err)
 	}
 	var r probeResult
-	fmt.Printf("testing path to %s ...\n\n", peer)
+	fmt.Printf("link test to %s  (%d samples each) ...\n\n", peer, probeSamples)
 
-	// --- TCP control ---
+	// --- TCP control + latency/jitter/loss via PING/PONG ---
 	var cc net.Conn
 	var rd *bufio.Reader
-	t0 := time.Now()
-	conn, err := net.DialTimeout("tcp", peer, 8*time.Second)
-	if err != nil {
-		fmt.Printf("TCP %-14s %s\n", peer, "UNREACHABLE: "+err.Error())
-	} else {
+	if conn, err := net.DialTimeout("tcp", peer, 8*time.Second); err == nil {
 		cc = conn
 		rd = bufio.NewReader(cc)
-		r.tcpOK = true
-		r.tcpRTT = time.Since(t0)
 		defer cc.Close()
-		fmt.Fprintln(cc, "PING")
-		cc.SetReadDeadline(time.Now().Add(5 * time.Second))
-		rd.ReadString('\n')
+		r.tcp = pingLoop(cc, rd)
+	} else {
+		fmt.Printf("TCP connect failed: %v\n", err)
 	}
 
-	// --- UDP plain ---
-	udpPeer := net.JoinHostPort(host, port)
-	if uc, err := net.Dial("udp", udpPeer); err == nil {
-		tag := fmt.Sprintf("U%d", time.Now().UnixNano())
-		for i := 0; i < 20; i++ {
-			uc.Write([]byte(tag))
-			time.Sleep(20 * time.Millisecond)
-		}
+	// --- UDP latency/jitter/loss via echo ---
+	if uc, err := net.Dial("udp", net.JoinHostPort(host, port)); err == nil {
+		r.udp = udpEcho(uc)
 		uc.Close()
-		if r.tcpOK {
-			got, _ := askCount(cc, rd, tag)
-			r.udpOK = got > 0
-			r.udpLoss = (20 - got) * 100 / 20
-			if r.udpLoss < 0 {
-				r.udpLoss = 0
-			}
-		} else {
-			r.udpRTTnote = "cannot confirm (TCP control down)"
-		}
 	}
 
-	// --- IP spoofing (Linux, needs the raw sender) ---
-	if spoofSrc != "" && r.tcpOK {
-		r.spoofTested = true
+	// --- IP spoofing (Linux + root): does a forged source reach the peer? ---
+	if spoofSrc != "" && cc != nil {
 		if sender, err := buildSender(nil, spoofSrc, peer); err == nil {
+			r.spoofTested = true
 			tag := fmt.Sprintf("S%d", time.Now().UnixNano())
 			dst, _ := net.ResolveUDPAddr("udp", peer)
 			for i := 0; i < 20; i++ {
 				sender.sendTo([]byte(tag), dst)
-				time.Sleep(20 * time.Millisecond)
+				time.Sleep(15 * time.Millisecond)
 			}
 			sender.Close()
 			got, from := askCount(cc, rd, tag)
 			r.spoofOK = got > 0
 			r.spoofSeenFrom = from
 		} else {
-			r.spoofTested = false // not supported here (non-Linux / no root)
 			fmt.Printf("(ip-spoofing test skipped: %v)\n", err)
 		}
 	}
 
-	printProbeReport(r)
+	printLinkReport(r)
 	return nil
+}
+
+// pingLoop measures TCP RTTs with sequential PING/PONG.
+func pingLoop(cc net.Conn, rd *bufio.Reader) linkStats {
+	var rtts []float64
+	st := linkStats{ok: true, sent: probeSamples}
+	for i := 0; i < probeSamples; i++ {
+		t0 := time.Now()
+		if _, err := fmt.Fprintln(cc, "PING"); err != nil {
+			break
+		}
+		cc.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := rd.ReadString('\n'); err != nil {
+			continue // lost / timed out
+		}
+		rtts = append(rtts, float64(time.Since(t0).Microseconds())/1000.0)
+		time.Sleep(10 * time.Millisecond)
+	}
+	cc.SetReadDeadline(time.Time{})
+	fill(&st, rtts)
+	return st
+}
+
+// udpEcho measures UDP RTT/loss with sequential echo requests.
+func udpEcho(uc net.Conn) linkStats {
+	var rtts []float64
+	st := linkStats{sent: probeSamples}
+	buf := make([]byte, 2048)
+	for i := 0; i < probeSamples; i++ {
+		msg := fmt.Sprintf("E%d-%d", i, time.Now().UnixNano())
+		t0 := time.Now()
+		if _, err := uc.Write([]byte(msg)); err != nil {
+			break
+		}
+		uc.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := uc.Read(buf)
+		if err != nil || string(buf[:n]) != msg {
+			continue
+		}
+		rtts = append(rtts, float64(time.Since(t0).Microseconds())/1000.0)
+		time.Sleep(10 * time.Millisecond)
+	}
+	st.ok = len(rtts) > 0
+	fill(&st, rtts)
+	return st
+}
+
+// fill computes recv count, loss%, average latency and jitter (mean absolute
+// difference between consecutive RTTs, RFC 3550 style).
+func fill(st *linkStats, rtts []float64) {
+	st.recv = len(rtts)
+	if st.sent > 0 {
+		st.lossPct = (st.sent - st.recv) * 100 / st.sent
+	}
+	if len(rtts) == 0 {
+		return
+	}
+	var sum, jit float64
+	for i, v := range rtts {
+		sum += v
+		if i > 0 {
+			jit += math.Abs(v - rtts[i-1])
+		}
+	}
+	st.avgMS = sum / float64(len(rtts))
+	if len(rtts) > 1 {
+		st.jitterMS = jit / float64(len(rtts)-1)
+	}
 }
 
 func askCount(cc net.Conn, br *bufio.Reader, tag string) (int, string) {
 	if cc == nil {
 		return 0, ""
 	}
-	time.Sleep(300 * time.Millisecond) // let the last datagrams land
+	time.Sleep(300 * time.Millisecond)
 	fmt.Fprintf(cc, "COUNT %s\n", tag)
 	cc.SetReadDeadline(time.Now().Add(5 * time.Second))
 	line, _ := br.ReadString('\n')
+	cc.SetReadDeadline(time.Time{})
 	var n int
 	var src string
 	fmt.Sscanf(strings.TrimSpace(line), "COUNT %d %s", &n, &src)
 	return n, src
 }
 
-func printProbeReport(r probeResult) {
-	ok := func(b bool) string {
-		if b {
-			return "✓"
+func printLinkReport(r probeResult) {
+	row := func(name string, s linkStats) {
+		if !s.ok {
+			fmt.Printf("  %-5s  ✗ unreachable\n", name)
+			return
 		}
-		return "✗"
+		fmt.Printf("  %-5s  ✓  latency %.1f ms   jitter %.1f ms   loss %d%%\n", name, s.avgMS, s.jitterMS, s.lossPct)
 	}
-	fmt.Println("── results ─────────────────────────────────")
-	if r.tcpOK {
-		fmt.Printf("TCP reachable   %s  (%.0f ms)\n", ok(true), float64(r.tcpRTT.Milliseconds()))
-	} else {
-		fmt.Printf("TCP reachable   %s\n", ok(false))
-	}
-	if r.udpOK {
-		fmt.Printf("UDP reachable   %s  (%d%% loss)\n", ok(true), r.udpLoss)
-	} else {
-		fmt.Printf("UDP reachable   %s  %s\n", ok(false), r.udpRTTnote)
-	}
+	fmt.Println("── link test ───────────────────────────────")
+	row("TCP", r.tcp)
+	row("UDP", r.udp)
 	if r.spoofTested {
 		if r.spoofOK {
-			fmt.Printf("IP spoofing     %s  (peer saw forged source %s)\n", ok(true), r.spoofSeenFrom)
+			fmt.Printf("  SPOOF  ✓  forged source allowed (peer saw %s)\n", r.spoofSeenFrom)
 		} else {
-			fmt.Printf("IP spoofing     %s  (datacenter filters forged source — BCP38)\n", ok(false))
+			fmt.Printf("  SPOOF  ✗  datacenter filters forged source (BCP38)\n")
 		}
 	} else {
-		fmt.Printf("IP spoofing     -  (not tested; Linux+root only)\n")
+		fmt.Printf("  SPOOF  -  not tested (Linux+root only)\n")
 	}
 	fmt.Println("────────────────────────────────────────────")
-	fmt.Println("you can build these tunnels:")
-	if r.tcpOK {
-		fmt.Println("  • tcp, tcpmux, ws, wsmux, wss, wssmux   (TCP path open)")
-	} else {
-		fmt.Println("  • (no TCP-based transport — TCP path blocked)")
+	fmt.Println("recommendation:")
+	for _, line := range recommend(r) {
+		fmt.Println("  " + line)
 	}
-	if r.udpOK {
-		fmt.Println("  • spoof, spoofmux, direct               (UDP path open)")
-		if r.spoofOK {
-			fmt.Println("  • spoof_source usable                   (forged-source UDP allowed)")
-		}
-	} else {
-		fmt.Println("  • (no UDP transport — UDP path blocked)")
+}
+
+// recommend picks a transport from the measured route, in the spirit of
+// BackPack's link test (favouring the ARQ/KCP-style transport on lossy routes,
+// and TCP-mux on clean ones).
+func recommend(r probeResult) []string {
+	tcp, udp := r.tcp, r.udp
+	var out []string
+	switch {
+	case !tcp.ok && !udp.ok:
+		return []string{"✗ neither TCP nor UDP reached the peer — the path looks fully blocked.",
+			"check the port/firewall, or try port 443 / a different server."}
+	case udp.ok && (udp.lossPct >= 5 || udp.jitterMS >= 30) && (!tcp.ok || udp.lossPct <= tcp.lossPct+10):
+		out = append(out, "→ spoofmux   (UDP path, lossy/jittery — the KCP-style ARQ handles loss best)")
+	case tcp.ok && tcp.lossPct <= 2 && tcp.jitterMS < 30:
+		out = append(out, "→ tcpmux     (clean, low-latency route — simplest and efficient)")
+	case tcp.ok:
+		out = append(out, "→ tcpmux     (TCP path works; mux rides out the loss/jitter)")
+	case udp.ok:
+		out = append(out, "→ spoofmux   (only UDP got through)")
 	}
+	out = append(out, "+ add  encryption = true  on both ends for an encrypted tunnel")
+	if tcp.ok {
+		out = append(out, "• to look like plain HTTPS (CDN / DPI): use  wssmux")
+	}
+	if r.spoofOK {
+		out = append(out, "• forged-source UDP is allowed here: you may also set  spoof_source")
+	}
+	return out
 }
