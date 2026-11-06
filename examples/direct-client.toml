@@ -1,0 +1,10 @@
+# Direct mode (BackPack-style L3 tunnel) — CLIENT side (dials out).
+[direct]
+role = "client"
+remote_addr = "SERVER_IP:3090"  # the server's real ip:port
+token = "CHANGE_ME"
+tun_name = "pol0"
+local_ip = "10.200.0.2"         # this side's tunnel IP (mirror of the server)
+peer_ip  = "10.200.0.1"
+mtu = 1400
+log_level = "info"

@@ -49,6 +49,9 @@ func main() {
 		setLogLevel(cfg.Client.LogLevel)
 		go func() { errc <- NewClient(cfg.Client).Run() }()
 	}
+	if cfg.Direct != nil {
+		go func() { errc <- RunDirect(cfg.Direct) }()
+	}
 	if err := <-errc; err != nil {
 		log.Fatalf("fatal: %v", err)
 	}

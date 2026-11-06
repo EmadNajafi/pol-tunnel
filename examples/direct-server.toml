@@ -1,0 +1,15 @@
+# Direct mode (BackPack-style L3 tunnel) — SERVER side (listens).
+# A TUN interface carries raw IP packets, encrypted (X25519 handshake +
+# AES-256-GCM) over UDP. Linux + root only. This side waits for the peer.
+[direct]
+role = "server"
+bind_addr = "0.0.0.0:3090"     # UDP port the client connects to
+token = "CHANGE_ME"            # same on both sides (pol -gen-token)
+tun_name = "pol0"
+local_ip = "10.200.0.1"        # this side's tunnel IP
+peer_ip  = "10.200.0.2"        # the other side's tunnel IP
+mtu = 1400
+log_level = "info"
+# After it's up: both machines can reach each other at the tunnel IPs above.
+# e.g. run any service on 10.200.0.1 and reach it from the peer, or add your
+# own routes to send more traffic through the tunnel.

@@ -13,6 +13,7 @@ import (
 type Config struct {
 	Server *ServerConfig
 	Client *ClientConfig
+	Direct *DirectConfig
 }
 
 type Common struct {
@@ -300,8 +301,34 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		cfg.Client = cc
 	}
-	if cfg.Server == nil && cfg.Client == nil {
-		return nil, fmt.Errorf("config needs a [server] or [client] section")
+	if s, ok := t["direct"]; ok {
+		sec := section(s)
+		d := &DirectConfig{
+			Role:       strings.ToLower(sec.str("role", "")),
+			BindAddr:   sec.str("bind_addr", "0.0.0.0:3090"),
+			RemoteAddr: sec.str("remote_addr", ""),
+			Token:      sec.str("token", ""),
+			TunName:    sec.str("tun_name", "pol0"),
+			LocalIP:    sec.str("local_ip", ""),
+			PeerIP:     sec.str("peer_ip", ""),
+			MTU:        sec.num("mtu", 1400),
+		}
+		if d.Role != "server" && d.Role != "client" {
+			return nil, fmt.Errorf("direct.role must be \"server\" or \"client\"")
+		}
+		if d.Token == "" {
+			return nil, fmt.Errorf("direct.token is required")
+		}
+		if d.LocalIP == "" || d.PeerIP == "" {
+			return nil, fmt.Errorf("direct needs local_ip and peer_ip (point-to-point tunnel addresses)")
+		}
+		if d.Role == "client" && d.RemoteAddr == "" {
+			return nil, fmt.Errorf("direct client needs remote_addr")
+		}
+		cfg.Direct = d
+	}
+	if cfg.Server == nil && cfg.Client == nil && cfg.Direct == nil {
+		return nil, fmt.Errorf("config needs a [server], [client] or [direct] section")
 	}
 	for _, c := range []*Common{commonOf(cfg.Server), commonOf2(cfg.Client)} {
 		if c == nil {

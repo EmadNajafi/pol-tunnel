@@ -146,6 +146,25 @@ systemctl daemon-reload && systemctl enable --now pol
 # تست با جعل: روی دو سرور لینوکسی، با sudo، spoof_source را ست کنید
 ```
 
+## ۸. حالت دایرکت (تونل L3 به سبک BackPack)
+
+علاوه بر تونل معکوس، pol یک **حالت دایرکت** دارد: یک اینترفیس **TUN لایه‌۳** روی هر طرف که **کل بسته‌های IP** را می‌برد (نه فقط چند پورت). مثل حالت direct در BackPack.
+
+- **رمزنگاری:** یک دست‌دادنِ شبیه Noise — تبادل کلید **X25519** (forward secrecy) با احراز هویت توسط توکن (HMAC)، بعد **AES-256-GCM** روی هر بسته. همه با کتابخانه‌ی استاندارد Go.
+- **حمل‌ونقل:** UDP (هر بسته‌ی IP داخل یک دیتاگرام رمزشده).
+- **MTU:** پیش‌فرض ۱۴۰۰ تا بعد از سربار IP/UDP/nonce/tag جا شود.
+- فقط یک آدرس point-to-point اضافه می‌کند؛ **مسیر default را دست نمی‌زند**، پس به شبکه‌ی موجود سرور آسیب نمی‌زند.
+
+**پیش‌نیاز:** لینوکس + **root** (برای `/dev/net/tun`). نمونه: [examples/direct-server.toml](examples/direct-server.toml) و [examples/direct-client.toml](examples/direct-client.toml).
+
+```bash
+sudo ./pol -c direct-server.toml   # روی یک سرور
+sudo ./pol -c direct-client.toml   # روی سرور دیگر
+# بعد از بالا آمدن: ping 10.200.0.1 / 10.200.0.2، یا هر سرویسی روی آن IPها
+```
+
+> ✅ **تست‌شده روی دو سرور واقعی ایران↔خارج:** تونل برقرار شد، ping هر دو جهت ۰٪ packet loss (~۸۵ms)، بسته‌های بزرگ بدون مشکل، و TCP (دانلود فایل با sha256 مطابق) از داخل تونل رمزنگاری‌شده عبور کرد — بدون اختلال در سرویس‌های موجود سرور.
+
 ## ۵. ساختار کد
 
 | فایل | نقش |
@@ -154,6 +173,8 @@ systemctl daemon-reload && systemctl enable --now pol
 | `arq.go` | لایه‌ی اطمینان‌پذیری شبیه KCP روی UDP (پنجره، ACK، RTO، کنترل ازدحام) |
 | `spoof.go` | ترنسپورت spoof: demux بر اساس connID، listener/dialer |
 | `rawsend_linux.go` / `rawsend_other.go` | ارسال با IP مبدأ جعلی (raw socket، فقط لینوکس) |
+| `direct.go` / `direct_crypto.go` | حالت دایرکت L3: موتور تونل، دست‌دادن X25519 و AES-GCM |
+| `tun_linux.go` / `tun_other.go` | اینترفیس TUN لایه‌۳ (فقط لینوکس) |
 | `mux.go` | مالتی‌پلکسر با flow control و half-close |
 | `websocket.go` | پیاده‌سازی مینیمال RFC 6455 (کلاینت و سرور) |
 | `transport.go` | listener/dialer برای tcp/ws/wss، TLS، `edge_ip` |
@@ -169,7 +190,7 @@ go test -v ./...
 ## ۶. کارهایی که هنوز انجام نشده (در مقایسه با BackPack)
 
 - ✅ ~~ترنسپورت UDP با اطمینان‌پذیری~~ و ✅ ~~جعل IP مبدأ~~ (بخش ۷) — انجام شد
+- ✅ ~~حالت دایرکت L3 (TUN + X25519 + AES-GCM)~~ (بخش ۸) — انجام و روی سرور واقعی تست شد
 - FEC (تصحیح خطای رو به جلو) روی لایه‌ی ARQ، و QUIC، و تونل داخل ICMP
-- رمزنگاری Noise روی ترنسپورت (الان spoof رمز نمی‌شود، فقط احراز هویت امن است)
 - fallback خودکار بین ترنسپورت‌ها و چند آدرس پشتیبان
 - PROXY protocol v2 برای رساندن IP واقعی کاربر به سرویس
