@@ -319,7 +319,7 @@ menu() {
     say "  7) Uninstall everything"
     say "  0) Exit"
     [ -x "$MGR" ] && say "${C_DIM}  (reopen this menu any time with:  poltunnel)${C_RESET}"
-    local c; read -rp $'\nchoice: ' c
+    local c; read -rp $'\nchoice: ' c || { echo; exit 0; } # exit cleanly on EOF (non-interactive)
     case "$c" in
       1) do_install; pause;;
       2) do_create; pause;;
@@ -335,4 +335,12 @@ menu() {
 }
 
 need_root
+# The menu is interactive. If stdin is not a terminal (e.g. piped via
+# `curl | bash`), don't spin — tell the user the correct way to run it.
+if [ ! -t 0 ]; then
+  err "run this in an interactive terminal:"
+  say "  sudo bash <(curl -fsSL $RAW_URL)"
+  say "or after install just run:  poltunnel"
+  exit 1
+fi
 menu
