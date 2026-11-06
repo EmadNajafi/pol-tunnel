@@ -55,9 +55,8 @@ do_install() {
 
 ensure_installed() { [ -x "$BIN" ] || { warn "pol is not installed yet"; do_install; }; }
 
-# ---------- transport picker ----------
+# ---------- transport picker (prints the chosen transport on stdout) ----------
 pick_transport() {
-  local __out=$1
   {
   say "  1) tcpmux    (default, recommended)"
   say "  2) tcp"
@@ -67,13 +66,12 @@ pick_transport() {
   say "  6) wss"
   say "  7) spoofmux  (UDP+ARQ, optional IP spoofing)"
   say "  8) spoof"
+  read -rp "transport [1]: " c
   } >&2
-  local c; read -rp "transport [1]: " c; c=${c:-1}
-  local t
+  c=${c:-1}
   case "$c" in
-    1) t=tcpmux;; 2) t=tcp;; 3) t=wsmux;; 4) t=wssmux;; 5) t=ws;; 6) t=wss;; 7) t=spoofmux;; 8) t=spoof;; *) t=tcpmux;;
+    1) echo tcpmux;; 2) echo tcp;; 3) echo wsmux;; 4) echo wssmux;; 5) echo ws;; 6) echo wss;; 7) echo spoofmux;; 8) echo spoof;; *) echo tcpmux;;
   esac
-  printf -v "$__out" '%s' "$t"
 }
 
 write_service() {
@@ -118,7 +116,7 @@ do_create() {
   case "$kind" in
     1) # reverse server
       local tr bind
-      pick_transport tr
+      tr=$(pick_transport)
       read -rp "tunnel bind port [3080]: " bind; bind=${bind:-3080}
       token="$(gen_token)"
       say "generated token (put the SAME token on the client):"
@@ -145,7 +143,7 @@ do_create() {
       ;;
     2) # reverse client
       local tr remote pool
-      pick_transport tr
+      tr=$(pick_transport)
       read -rp "server address (IRAN_IP:PORT): " remote
       read -rp "token (from the server): " token
       read -rp "connection_pool [8]: " pool; pool=${pool:-8}
@@ -213,28 +211,31 @@ do_list() {
   [ $any -eq 0 ] && warn "no tunnels yet (create one from the menu)"
 }
 
+# prints the chosen tunnel name on stdout (menu + prompt go to stderr)
 pick_tunnel() {
-  local __out=$1 names=($(list_names))
+  local names=($(list_names))
   [ ${#names[@]} -eq 0 ] && { warn "no tunnels"; return 1; }
-  local i=1 n
-  for n in "${names[@]}"; do say "  $i) $n"; i=$((i+1)); done >&2
-  local c; read -rp "pick [1]: " c; c=${c:-1}
-  printf -v "$__out" '%s' "${names[$((c-1))]:-}"
-  [ -n "${!__out}" ]
+  local i=1 nm c
+  { for nm in "${names[@]}"; do say "  $i) $nm"; i=$((i+1)); done
+    read -rp "pick [1]: " c; } >&2
+  c=${c:-1}
+  local sel="${names[$((c-1))]:-}"
+  [ -n "$sel" ] || return 1
+  printf '%s' "$sel"
 }
 
 do_startstop() {
-  local n; pick_tunnel n || return
+  local n; n=$(pick_tunnel) || return
   say "  1) start   2) stop   3) restart"
   local a; read -rp "action [3]: " a; a=${a:-3}
   case "$a" in 1) systemctl start "pol-$n";; 2) systemctl stop "pol-$n";; *) systemctl restart "pol-$n";; esac
   ok "done"; systemctl --no-pager status "pol-$n" | sed -n '1,4p'
 }
 
-do_logs() { local n; pick_tunnel n || return; journalctl -u "pol-$n" --no-pager -n 30 -o cat; }
+do_logs() { local n; n=$(pick_tunnel) || return; journalctl -u "pol-$n" --no-pager -n 30 -o cat; }
 
 do_delete() {
-  local n; pick_tunnel n || return
+  local n; n=$(pick_tunnel) || return
   systemctl disable --now "pol-$n.service" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/pol-$n.service" "$CFGDIR/$n.toml"
   systemctl daemon-reload
