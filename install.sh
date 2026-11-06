@@ -276,18 +276,30 @@ do_delete() {
   ok "tunnel '$n' deleted"
 }
 
-# connectivity test between two servers (which transports the path allows)
+# tunnel test between two servers
 do_conntest() {
   ensure_installed
-  say "Connectivity test — needs BOTH servers:"
-  say "  1) LISTENER  (run this FIRST, on the server that will host the tunnel / Iran)"
-  say "  2) TEST      (run on the OTHER server; it probes the listener and reports)"
+  say "Tunnel test — needs BOTH servers. Pick the agent side first."
+  say ""
+  say "  FULL live test (actually builds every tunnel, shows which run):"
+  say "    1) AGENT        — run on the server that will HOST the tunnel (e.g. Iran)"
+  say "    2) RUN the test — run on the OTHER server (needs the agent's IP)"
+  say ""
+  say "  QUICK link test (latency / jitter / loss + a recommendation):"
+  say "    3) listener     — on the tunnel-host server"
+  say "    4) run          — on the other server"
   local c; read -rp "choice [2]: " c; c=${c:-2}
   case "$c" in
-    1) local p; read -rp "listen port [7000]: " p; p=${p:-7000}
-       say "listening on :$p (tcp+udp) — run the TEST on the other server, then Ctrl-C here"
+    1) local p; read -rp "agent control port [46000]: " p; p=${p:-46000}
+       say "agent up on :$p — now run option 2 on the other server; Ctrl-C here when done"
+       "$BIN" -test-agent ":$p" ;;
+    2) local a; read -rp "agent address (HOST_SERVER_IP:46000): " a
+       [ -z "$a" ] && { err "no address"; return 1; }
+       "$BIN" -test-run "$a" ;;
+    3) local p; read -rp "listen port [7000]: " p; p=${p:-7000}
+       say "listening on :$p — run option 4 on the other server, then Ctrl-C"
        "$BIN" -probe-listen ":$p" ;;
-    *) local peer; read -rp "listener address (OTHER_SERVER_IP:PORT): " peer
+    4) local peer; read -rp "listener address (OTHER_SERVER_IP:7000): " peer
        [ -z "$peer" ] && { err "no address"; return 1; }
        "$BIN" -probe "$peer" ;;
   esac
@@ -315,7 +327,7 @@ menu() {
     say "  3) Start / stop / restart a tunnel"
     say "  4) Show a tunnel's logs"
     say "  5) Delete a tunnel"
-    say "  6) Test connectivity between two servers"
+    say "  6) Test tunnels between two servers (live)"
     say "  7) Uninstall everything"
     say "  0) Exit"
     [ -x "$MGR" ] && say "${C_DIM}  (reopen this menu any time with:  poltunnel)${C_RESET}"

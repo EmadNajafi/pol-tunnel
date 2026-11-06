@@ -15,9 +15,11 @@ func main() {
 	cfgPath := flag.String("c", "config.toml", "path to config file")
 	genToken := flag.Bool("gen-token", false, "print a random 64-char token and exit")
 	showVer := flag.Bool("version", false, "print version and exit")
-	probeListen := flag.String("probe-listen", "", "connectivity test: listen on this addr (run on one server)")
-	probe := flag.String("probe", "", "connectivity test: test the path to this HOST:PORT (run on the other server)")
+	probeListen := flag.String("probe-listen", "", "link test: listen on this addr (run on one server)")
+	probe := flag.String("probe", "", "link test: measure the path to this HOST:PORT (run on the other server)")
 	spoofSrc := flag.String("spoof-src", "192.0.2.123", "forged source IP used by the -probe spoof test")
+	testAgent := flag.String("test-agent", "", "live tunnel test: run the agent on this addr (the tunnel-host server)")
+	testRun := flag.String("test-run", "", "live tunnel test: run every tunnel against the agent at HOST:PORT (other server)")
 	flag.Parse()
 
 	if *showVer {
@@ -39,6 +41,18 @@ func main() {
 	if *probe != "" {
 		if err := runProbe(*probe, *spoofSrc); err != nil {
 			log.Fatalf("probe: %v", err)
+		}
+		return
+	}
+	if *testAgent != "" {
+		if err := runTestAgent(*testAgent); err != nil {
+			log.Fatalf("test-agent: %v", err)
+		}
+		return
+	}
+	if *testRun != "" {
+		if err := runTestRun(*testRun); err != nil {
+			log.Fatalf("test-run: %v", err)
 		}
 		return
 	}

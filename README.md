@@ -76,7 +76,25 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o pol
 ./pol -c client.toml      # روی سرور خارج
 ```
 
-**لینک‌تست بین دو سرور** (به سبک Link Test بک‌پک — در منو هم هست: گزینه «Test connectivity»):
+**تست زنده‌ی همه‌ی تانل‌ها بین دو سرور** (هر تانل واقعی — ۶ ریورس + spoof/spoofmux + direct — را عملاً بالا می‌آورد، لایو روی هر دو سرور نشان می‌دهد، و آخر می‌گوید کدام‌ها اجرا می‌شوند؛ در منو: گزینه «Test tunnels»):
+
+```bash
+# روی سروری که میزبان تانل می‌شود (مثلاً ایران):
+./pol -test-agent :46000
+# روی سرور دیگر:
+./pol -test-run HOST_IP:46000
+```
+خروجی سمت runner:
+```
+  testing tcp       ... ✓
+  testing tcpmux    ... ✓
+  ...
+  testing direct    ... ✓
+── which tunnels run on these two servers ──
+usable: tcp, tcpmux, ws, wsmux, wss, wssmux, spoof, spoofmux, direct
+```
+
+**لینک‌تست سریع بین دو سرور** (به سبک Link Test بک‌پک — تأخیر/jitter/loss + پیشنهاد):
 
 ```bash
 # روی سروری که میزبان تانل می‌شود (ایران):
