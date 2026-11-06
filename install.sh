@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # pol — interactive installer & tunnel manager (Backhaul/BackPack-style menu).
 #
-#   bash <(curl -fsSL https://raw.githubusercontent.com/EmadNajafi/pol-tunnel/main/install.sh)
+#   curl -fsSL https://raw.githubusercontent.com/EmadNajafi/pol-tunnel/main/install.sh | sudo bash
+#
+# (Not `sudo bash <(curl ...)`: sudo closes the /dev/fd pipe, so bash reports
+# "/dev/fd/63: No such file or directory".)
 #
 # Manages one or more tunnels, each as a systemd service pol-<name>.service with
 # its config at /etc/pol/<name>.toml. Needs root (Linux).
@@ -381,12 +384,23 @@ menu() {
 }
 
 need_root
-# The menu is interactive. If stdin is not a terminal (e.g. piped via
-# `curl | bash`), don't spin — tell the user the correct way to run it.
-if [ ! -t 0 ]; then
-  err "run this in an interactive terminal:"
-  say "  sudo bash <(curl -fsSL $RAW_URL)"
-  say "or after install just run:  poltunnel"
-  exit 1
-fi
-menu
+# The menu is interactive. When the script is piped in (`curl | sudo bash`),
+# stdin is the pipe, so read the answers from the terminal instead; with no
+# terminal at all, say how to run it rather than spin.
+# Everything runs from one function called on the last line: bash has read the
+# whole call before it runs, so reattaching stdin to the terminal below is safe
+# even when the script itself arrived on stdin (`curl ... | sudo bash`).
+main() {
+  if [ ! -t 0 ]; then
+    if { : </dev/tty; } 2>/dev/null; then
+      exec </dev/tty
+    else
+      err "no terminal to show the menu on. Run it like this:"
+      say "  curl -fsSL $RAW_URL | sudo bash"
+      say "or after install just run:  sudo poltunnel"
+      exit 1
+    fi
+  fi
+  menu
+}
+main "$@"
