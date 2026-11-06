@@ -9,6 +9,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"sync/atomic"
+	"time"
 )
 
 // Direct-mode cryptography: a Noise-like handshake giving forward secrecy plus
@@ -16,7 +18,7 @@ import (
 //
 // Handshake (over UDP, the initiator retransmits INIT until it gets RESP):
 //
-//	I -> R : 0x01 | ephI[32] | HMAC(token, "pol-direct-init" | ephI)
+//	I -> R : 0x01 | ts[8] | ephI[32] | HMAC(token, "pol-direct-init" | ts | ephI)
 //	R -> I : 0x02 | ephR[32] | HMAC(token, "pol-direct-resp" | ephI | ephR)
 //
 // Both derive ss = X25519(ownEph, peerEph), then
@@ -25,6 +27,10 @@ import (
 //	kR2I = HKDF-Expand(prk, "pol-direct r2i", 32)
 // The initiator seals with kI2R / opens with kR2I; the responder is opposite.
 // A MITM without the token cannot forge the HMACs, so it cannot complete it.
+// The responder rejects INITs whose timestamp is outside initMaxSkew and
+// remembers recently seen ephI keys, so a captured INIT cannot be replayed to
+// reset the session; it also keeps the old keys until the first DATA packet
+// sealed with the new ones arrives.
 
 const (
 	dirINIT byte = 1
@@ -109,14 +115,14 @@ func deriveKeys(token string, ss []byte, initiator bool) (*directKeys, error) {
 // direction has its own key, so each counter can start at 0 without collision.
 type aeadCounter struct {
 	aead    cipher.AEAD
-	counter uint64
+	counter atomic.Uint64 // seal may be called from several goroutines (data + keepalive)
 }
 
 // seal encrypts p, returning nonce[12] | ciphertext.
 func (a *aeadCounter) seal(p []byte) []byte {
-	a.counter++
+	ctr := a.counter.Add(1)
 	nonce := make([]byte, gcmNonce)
-	binary.BigEndian.PutUint64(nonce[4:], a.counter)
+	binary.BigEndian.PutUint64(nonce[4:], ctr)
 	out := make([]byte, gcmNonce, gcmNonce+len(p)+gcmTag)
 	copy(out, nonce)
 	return a.aead.Seal(out, nonce, p, nil)
@@ -136,11 +142,21 @@ func genEphemeral() (*ecdh.PrivateKey, error) {
 	return ecdh.X25519().GenerateKey(rand.Reader)
 }
 
-func makeInit(token string, ephPub []byte) []byte {
-	b := make([]byte, 0, 1+x25519Len+sha256.Size)
+// initMaxSkew bounds how old (or how far in the future) an INIT timestamp may
+// be. Together with the responder's memory of recently seen INIT keys this
+// stops a captured INIT from being replayed later to reset the session.
+const initMaxSkew = 120 * time.Second
+
+const initLen = 1 + 8 + x25519Len + sha256.Size
+
+func makeInit(token string, ephPub []byte, now time.Time) []byte {
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], uint64(now.Unix()))
+	b := make([]byte, 0, initLen)
 	b = append(b, dirINIT)
+	b = append(b, ts[:]...)
 	b = append(b, ephPub...)
-	b = append(b, dmac(token, []byte("pol-direct-init"), ephPub)...)
+	b = append(b, dmac(token, []byte("pol-direct-init"), ts[:], ephPub)...)
 	return b
 }
 
@@ -154,14 +170,23 @@ func makeResp(token string, initPub, ephPub []byte) []byte {
 
 var errBadHandshake = errors.New("direct: handshake authentication failed")
 
-func parseInit(token string, msg []byte) (ephPub []byte, err error) {
-	if len(msg) != 1+x25519Len+sha256.Size || msg[0] != dirINIT {
+var errStaleInit = errors.New("direct: INIT timestamp outside the allowed window (replay or clock skew)")
+
+// parseInit authenticates an INIT and checks its timestamp is within
+// initMaxSkew of now. It returns the initiator's ephemeral public key.
+func parseInit(token string, msg []byte, now time.Time) (ephPub []byte, err error) {
+	if len(msg) != initLen || msg[0] != dirINIT {
 		return nil, errBadHandshake
 	}
-	ephPub = msg[1 : 1+x25519Len]
-	want := dmac(token, []byte("pol-direct-init"), ephPub)
-	if !hmac.Equal(msg[1+x25519Len:], want) {
+	ts := msg[1:9]
+	ephPub = msg[9 : 9+x25519Len]
+	want := dmac(token, []byte("pol-direct-init"), ts, ephPub)
+	if !hmac.Equal(msg[9+x25519Len:], want) {
 		return nil, errBadHandshake
+	}
+	sent := time.Unix(int64(binary.BigEndian.Uint64(ts)), 0)
+	if d := now.Sub(sent); d > initMaxSkew || d < -initMaxSkew {
+		return nil, errStaleInit
 	}
 	return ephPub, nil
 }
