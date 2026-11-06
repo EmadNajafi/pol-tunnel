@@ -38,8 +38,13 @@ func buildSender(sock *net.UDPConn, spoofSrc, refAddr string) (packetSender, err
 	}
 	s := &rawSender{fd: fd}
 	copy(s.srcIP[:], ip)
-	if la, ok := sock.LocalAddr().(*net.UDPAddr); ok {
-		s.srcPort = uint16(la.Port)
+	if sock != nil {
+		if la, ok := sock.LocalAddr().(*net.UDPAddr); ok {
+			s.srcPort = uint16(la.Port)
+		}
+	}
+	if s.srcPort == 0 {
+		s.srcPort = 40000
 	}
 	return s, nil
 }

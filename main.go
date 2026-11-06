@@ -9,12 +9,15 @@ import (
 	"os"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	cfgPath := flag.String("c", "config.toml", "path to config file")
 	genToken := flag.Bool("gen-token", false, "print a random 64-char token and exit")
 	showVer := flag.Bool("version", false, "print version and exit")
+	probeListen := flag.String("probe-listen", "", "connectivity test: listen on this addr (run on one server)")
+	probe := flag.String("probe", "", "connectivity test: test the path to this HOST:PORT (run on the other server)")
+	spoofSrc := flag.String("spoof-src", "192.0.2.123", "forged source IP used by the -probe spoof test")
 	flag.Parse()
 
 	if *showVer {
@@ -25,6 +28,18 @@ func main() {
 		b := make([]byte, 32)
 		rand.Read(b)
 		fmt.Println(hex.EncodeToString(b))
+		return
+	}
+	if *probeListen != "" {
+		if err := runProbeListen(*probeListen); err != nil {
+			log.Fatalf("probe-listen: %v", err)
+		}
+		return
+	}
+	if *probe != "" {
+		if err := runProbe(*probe, *spoofSrc); err != nil {
+			log.Fatalf("probe: %v", err)
+		}
 		return
 	}
 

@@ -265,6 +265,23 @@ do_delete() {
   ok "tunnel '$n' deleted"
 }
 
+# connectivity test between two servers (which transports the path allows)
+do_conntest() {
+  ensure_installed
+  say "Connectivity test — needs BOTH servers:"
+  say "  1) LISTENER  (run this FIRST, on the server that will host the tunnel / Iran)"
+  say "  2) TEST      (run on the OTHER server; it probes the listener and reports)"
+  local c; read -rp "choice [2]: " c; c=${c:-2}
+  case "$c" in
+    1) local p; read -rp "listen port [7000]: " p; p=${p:-7000}
+       say "listening on :$p (tcp+udp) — run the TEST on the other server, then Ctrl-C here"
+       "$BIN" -probe-listen ":$p" ;;
+    *) local peer; read -rp "listener address (OTHER_SERVER_IP:PORT): " peer
+       [ -z "$peer" ] && { err "no address"; return 1; }
+       "$BIN" -probe "$peer" ;;
+  esac
+}
+
 do_uninstall() {
   read -rp "remove pol, all tunnels and configs? [y/N]: " c
   [ "${c,,}" = y ] || { say "cancelled"; return; }
@@ -287,7 +304,8 @@ menu() {
     say "  3) Start / stop / restart a tunnel"
     say "  4) Show a tunnel's logs"
     say "  5) Delete a tunnel"
-    say "  6) Uninstall everything"
+    say "  6) Test connectivity between two servers"
+    say "  7) Uninstall everything"
     say "  0) Exit"
     local c; read -rp $'\nchoice: ' c
     case "$c" in
@@ -296,7 +314,8 @@ menu() {
       3) do_startstop; pause;;
       4) do_logs; pause;;
       5) do_delete; pause;;
-      6) do_uninstall; pause;;
+      6) do_conntest; pause;;
+      7) do_uninstall; pause;;
       0|q) exit 0;;
       *) ;;
     esac

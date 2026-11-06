@@ -70,6 +70,16 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o pol
 ./pol -c client.toml      # روی سرور خارج
 ```
 
+**تست کانکشن بین دو سرور** (می‌گوید چه تانل‌هایی ساختنی است — در منو هم هست: گزینه «Test connectivity»):
+
+```bash
+# روی سروری که میزبان تانل می‌شود (ایران):
+./pol -probe-listen :7000
+# روی سرور دیگر (خارج):
+./pol -probe IRAN_IP:7000
+```
+خروجی: دسترسی TCP و UDP (با تأخیر و درصد گم‌شدن) و امکان جعل‌IP را می‌سنجد و فهرست ترنسپورت‌های قابل‌ساخت را چاپ می‌کند.
+
 نمونه کانفیگ‌ها در [examples/server.toml](examples/server.toml) و [examples/client.toml](examples/client.toml) هستند.
 توکن و `transport` باید در هر دو طرف یکی باشند.
 
