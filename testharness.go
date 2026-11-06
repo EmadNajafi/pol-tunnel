@@ -3,13 +3,17 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -23,10 +27,20 @@ import (
 // RUNNER (`pol -test-run AGENT_IP:CTRL`). The runner drives the test; both exec
 // the real pol binary for each tunnel, so what succeeds here is what will work.
 //
+// The agent prints a random test key; the runner must be given that key. The
+// control connection is authenticated with it (challenge/response, the key
+// never crosses the wire) and the tunnel token is derived from it, so nobody
+// else who can reach the agent's port can drive it.
+//
 // Control protocol (text lines over TCP):
-//   runner->agent: TOKEN <t> | SERVER <transport> <tunnelPort> <pubPort> <echoPort>
+//   agent->runner: HELLO <nonce>
+//   runner->agent: AUTH <hex HMAC(key, "pol-test-auth" | nonce)>
+//   agent->runner: WELCOME          (or the agent closes on a bad key)
+//   runner->agent: SERVER <transport> <tunnelPort> <pubPort> <echoPort>
 //                  DIRECT <udpPort> <localIP> <peerIP> | PROBE <pubPort> | STOP | BYE
 //   agent->runner: READY | OK | FAIL | STOPPED
+// Every argument is validated (known transport, numeric port, IPv4 address)
+// before it reaches a generated config.
 
 var testTransports = []string{"tcp", "tcpmux", "ws", "wsmux", "wss", "wssmux", "spoof", "spoofmux"}
 
@@ -61,42 +75,94 @@ func killPol(cmd *exec.Cmd, cfgPath string) {
 
 // ---- agent (runs on the server that will host the tunnels) ----
 
+const testCmdTimeout = 2 * time.Minute
+
+func testAuthMAC(key, nonce string) string {
+	h := hmac.New(sha256.New, []byte(key))
+	h.Write([]byte("pol-test-auth|" + nonce))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// testToken derives the per-session tunnel token from the key and nonce, so the
+// token is never sent in the clear.
+func testToken(key, nonce string) string {
+	h := hmac.New(sha256.New, []byte(key))
+	h.Write([]byte("pol-test-token|" + nonce))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func validPort(s string) bool {
+	n, err := strconv.Atoi(s)
+	return err == nil && n > 0 && n < 65536 && strconv.Itoa(n) == s
+}
+
+func validIPv4(s string) bool {
+	ip := net.ParseIP(s)
+	return ip != nil && ip.To4() != nil && ip.String() == s
+}
+
 func runTestAgent(addr string) error {
 	if !strings.Contains(addr, ":") {
 		addr = ":" + addr
 	}
+	kb := make([]byte, 12)
+	if _, err := rand.Read(kb); err != nil {
+		return err
+	}
+	key := hex.EncodeToString(kb)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("test agent up on %s — run the test on the other server; Ctrl-C when done.\n", addr)
+	fmt.Printf("test agent up on %s\n", addr)
+	fmt.Printf("test key: %s   ← enter this on the other server when it asks\n", key)
+	fmt.Println("Ctrl-C when done.")
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			return err
 		}
-		agentSession(c)
+		agentSession(c, key)
 	}
 }
 
-func agentSession(c net.Conn) {
+func agentSession(c net.Conn, key string) {
 	defer c.Close()
 	var child *exec.Cmd
-	var cfgPath, token string
+	var cfgPath string
 	defer func() { killPol(child, cfgPath) }()
-	sc := bufio.NewScanner(c)
-	for sc.Scan() {
+
+	nb := make([]byte, 16)
+	rand.Read(nb)
+	nonce := hex.EncodeToString(nb)
+	c.SetDeadline(time.Now().Add(15 * time.Second))
+	fmt.Fprintf(c, "HELLO %s\n", nonce)
+	rd := bufio.NewReader(io.LimitReader(c, 1<<20))
+	line, err := rd.ReadString('\n')
+	f := strings.Fields(line)
+	if err != nil || len(f) != 2 || f[0] != "AUTH" ||
+		!hmac.Equal([]byte(f[1]), []byte(testAuthMAC(key, nonce))) {
+		fmt.Printf("  [agent] rejected a connection from %v (wrong test key)\n", c.RemoteAddr())
+		time.Sleep(time.Second)
+		return
+	}
+	fmt.Fprintln(c, "WELCOME")
+	token := testToken(key, nonce)
+	fmt.Printf("  [agent] runner %v authenticated\n", c.RemoteAddr())
+
+	sc := bufio.NewScanner(rd)
+	for {
+		c.SetDeadline(time.Now().Add(testCmdTimeout))
+		if !sc.Scan() {
+			return
+		}
 		f := strings.Fields(sc.Text())
 		if len(f) == 0 {
 			continue
 		}
 		switch f[0] {
-		case "TOKEN":
-			if len(f) > 1 {
-				token = f[1]
-			}
 		case "SERVER":
-			if len(f) < 5 {
+			if len(f) != 5 || !validTransport(f[1]) || !validPort(f[2]) || !validPort(f[3]) || !validPort(f[4]) {
 				fmt.Fprintln(c, "FAIL")
 				continue
 			}
@@ -109,7 +175,7 @@ func agentSession(c net.Conn) {
 			time.Sleep(1500 * time.Millisecond)
 			fmt.Fprintln(c, "READY")
 		case "DIRECT":
-			if len(f) < 4 {
+			if len(f) != 4 || !validPort(f[1]) || !validIPv4(f[2]) || !validIPv4(f[3]) {
 				fmt.Fprintln(c, "FAIL")
 				continue
 			}
@@ -122,7 +188,7 @@ func agentSession(c net.Conn) {
 			time.Sleep(1500 * time.Millisecond)
 			fmt.Fprintln(c, "READY")
 		case "PROBE":
-			if len(f) < 2 {
+			if len(f) != 2 || !validPort(f[1]) {
 				fmt.Fprintln(c, "FAIL")
 				continue
 			}
@@ -172,7 +238,7 @@ func agentProbe(pubPort string) bool {
 
 // ---- runner (drives the test from the other server) ----
 
-func runTestRun(agentAddr string) error {
+func runTestRun(agentAddr, key string) error {
 	host, _, err := net.SplitHostPort(agentAddr)
 	if err != nil {
 		return fmt.Errorf("agent address must be HOST:PORT: %w", err)
@@ -184,10 +250,23 @@ func runTestRun(agentAddr string) error {
 	defer ctl.Close()
 	rd := bufio.NewReader(ctl)
 
-	tokenB := make([]byte, 32)
-	rand.Read(tokenB)
-	token := hex.EncodeToString(tokenB)
-	fmt.Fprintf(ctl, "TOKEN %s\n", token)
+	if key == "" {
+		fmt.Print("test key (printed by the agent): ")
+		k, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		key = strings.TrimSpace(k)
+	}
+	ctl.SetDeadline(time.Now().Add(15 * time.Second))
+	f := strings.Fields(readLine(rd))
+	if len(f) != 2 || f[0] != "HELLO" {
+		return errors.New("agent did not greet (is it a current pol -test-agent?)")
+	}
+	nonce := f[1]
+	fmt.Fprintf(ctl, "AUTH %s\n", testAuthMAC(key, nonce))
+	if strings.TrimSpace(readLine(rd)) != "WELCOME" {
+		return errors.New("agent rejected the test key")
+	}
+	ctl.SetDeadline(time.Time{})
+	token := testToken(key, nonce)
 
 	const echoPort = "47900"
 	stopEcho := startEcho("127.0.0.1:" + echoPort)

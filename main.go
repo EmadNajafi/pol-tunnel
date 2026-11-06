@@ -20,6 +20,7 @@ func main() {
 	spoofSrc := flag.String("spoof-src", "192.0.2.123", "forged source IP used by the -probe spoof test")
 	testAgent := flag.String("test-agent", "", "live tunnel test: run the agent on this addr (the tunnel-host server)")
 	testRun := flag.String("test-run", "", "live tunnel test: run every tunnel against the agent at HOST:PORT (other server)")
+	testKey := flag.String("test-key", "", "live tunnel test: the key printed by -test-agent (asked for if omitted)")
 	flag.Parse()
 
 	if *showVer {
@@ -51,7 +52,7 @@ func main() {
 		return
 	}
 	if *testRun != "" {
-		if err := runTestRun(*testRun); err != nil {
+		if err := runTestRun(*testRun, *testKey); err != nil {
 			log.Fatalf("test-run: %v", err)
 		}
 		return
