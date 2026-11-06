@@ -1,0 +1,8 @@
+# build output
+/dist/
+*.exe
+pol
+!pol/
+# editor / os
+.DS_Store
+*.swp

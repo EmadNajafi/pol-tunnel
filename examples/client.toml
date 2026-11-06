@@ -1,0 +1,19 @@
+# Kharej side (client). Dials out to the Iran server; needs no open inbound port.
+[client]
+remote_addr = "IRAN_IP:3080"
+transport = "tcpmux"          # must match the server
+token = "CHANGE_ME"
+connection_pool = 8           # idle data conns (tcp/ws) or mux sessions (*mux)
+retry_interval = 3
+dial_timeout = 10
+nodelay = true
+keepalive_period = 75
+heartbeat = 20
+mux_framesize = 32768
+mux_window = 524288
+path = "/ws"
+# edge_ip = "104.16.0.1"     # ws*: dial a CDN edge, keep remote_addr as Host
+# tls_sni = "example.com"    # wss*: SNI / Host header
+tls_insecure = true           # wss*: accept self-signed server certs
+web_port = 2061
+log_level = "info"

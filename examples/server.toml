@@ -1,0 +1,23 @@
+# Iran side (server). Generate a token with: pol -gen-token
+[server]
+bind_addr = "0.0.0.0:3080"
+transport = "tcpmux"          # tcp | tcpmux | ws | wsmux | wss | wssmux
+token = "CHANGE_ME"
+accept_udp = false            # also forward UDP on the same ports
+nodelay = true
+keepalive_period = 75         # seconds
+heartbeat = 20                # seconds
+channel_size = 2048           # max pooled data conns / queued UDP packets
+mux_framesize = 32768
+mux_window = 524288           # per-stream receive window (bytes)
+path = "/ws"                  # websocket path (ws* transports)
+# tls_cert = "/etc/pol/cert.pem"   # wss*: omit both for a self-signed cert
+# tls_key  = "/etc/pol/key.pem"
+web_port = 2060               # stats panel on 127.0.0.1 (0 = off)
+log_level = "info"
+ports = [
+  "443",                      # :443 -> kharej 127.0.0.1:443
+  "8080=80",                  # :8080 -> kharej 127.0.0.1:80
+  "2000-2010",                # range, same ports
+  # "443-600:5201", "443=1.1.1.1:5201", "127.0.0.2:443=1.1.1.1:5201"
+]

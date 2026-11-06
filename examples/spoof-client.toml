@@ -1,0 +1,15 @@
+# Kharej side — spoof transport. Must match the server's transport and token.
+[client]
+remote_addr = "IRAN_IP:443"   # the server's REAL ip:port
+transport = "spoofmux"
+token = "CHANGE_ME"
+connection_pool = 8
+heartbeat = 20
+
+# spoof_source: forge THIS source IP on packets we send to the server.
+# Same requirements as the server (Linux, root, BCP38-free datacenter).
+# When set, the server MUST set peer_addr to this client's real ip:port.
+# spoof_source = "1.2.3.4"
+
+web_port = 2061
+log_level = "info"

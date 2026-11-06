@@ -1,0 +1,27 @@
+# Iran side — spoof transport (UDP + ARQ reliability, optional source-IP spoofing).
+# This is a POINT-TO-POINT link to ONE kharej client. Both ends run as root on Linux.
+[server]
+bind_addr = "0.0.0.0:443"
+transport = "spoofmux"        # spoof (pooled) | spoofmux (multiplexed, recommended)
+token = "CHANGE_ME"
+
+# peer_addr = the client's REAL ip:port. Required when the CLIENT forges its
+# source, because replies cannot go to a forged address. Also the port the
+# client's UDP socket is bound to (set it on the client with a fixed local port
+# if you spoof; otherwise learned automatically in plain mode).
+peer_addr = "KHAREJ_IP:443"
+
+# spoof_source: forge THIS source IP on packets we send to the client.
+# Leave empty to disable spoofing (plain UDP, works anywhere, still reliable).
+# When set: Linux + root (CAP_NET_RAW) + a datacenter that does NOT enforce
+# egress filtering (BCP38), or the packet is dropped at the first hop.
+# spoof_source = "5.6.7.8"
+
+accept_udp = false
+heartbeat = 20
+web_port = 2060
+log_level = "info"
+ports = [
+  "443",
+  "8080=80",
+]
