@@ -9,8 +9,10 @@ set -euo pipefail
 
 REPO="EmadNajafi/pol-tunnel"
 BIN="/usr/local/bin/pol"
+MGR="/usr/local/bin/poltunnel"
 CFGDIR="/etc/pol"
 VERSION_TAG="latest"
+RAW_URL="https://raw.githubusercontent.com/$REPO/main/install.sh"
 
 C_RESET=$'\e[0m'; C_B=$'\e[1m'; C_GRN=$'\e[32m'; C_YEL=$'\e[33m'; C_RED=$'\e[31m'; C_CYN=$'\e[36m'; C_DIM=$'\e[2m'
 
@@ -51,6 +53,15 @@ do_install() {
   install -m 0755 "$tmp" "$BIN"; rm -f "$tmp"
   mkdir -p "$CFGDIR"
   ok "installed $("$BIN" -version) at $BIN"
+  # install this manager as the `poltunnel` command (atomic replace so it is
+  # safe even when the running menu is itself /usr/local/bin/poltunnel)
+  if curl -fsSL "$RAW_URL" -o "$MGR.new" 2>/dev/null && [ -s "$MGR.new" ]; then
+    chmod 0755 "$MGR.new"; mv -f "$MGR.new" "$MGR"
+    ok "menu command installed — just run:  poltunnel"
+  else
+    rm -f "$MGR.new"
+    warn "could not install the 'poltunnel' command (no internet?); the menu still works via the one-liner"
+  fi
 }
 
 ensure_installed() { [ -x "$BIN" ] || { warn "pol is not installed yet"; do_install; }; }
@@ -288,7 +299,7 @@ do_uninstall() {
   local n
   for n in $(list_names); do systemctl disable --now "pol-$n.service" >/dev/null 2>&1 || true; rm -f "/etc/systemd/system/pol-$n.service"; done
   systemctl daemon-reload
-  rm -rf "$CFGDIR" "$BIN"
+  rm -rf "$CFGDIR" "$BIN" "$MGR"
   ok "pol removed"
 }
 
@@ -307,6 +318,7 @@ menu() {
     say "  6) Test connectivity between two servers"
     say "  7) Uninstall everything"
     say "  0) Exit"
+    [ -x "$MGR" ] && say "${C_DIM}  (reopen this menu any time with:  poltunnel)${C_RESET}"
     local c; read -rp $'\nchoice: ' c
     case "$c" in
       1) do_install; pause;;

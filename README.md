@@ -58,6 +58,12 @@ UDP روی stream:  len[2] | datagram
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/EmadNajafi/pol-tunnel/main/install.sh)
 ```
 
+بعد از نصب، هر وقت خواستی منو را باز کنی فقط کافی است بزنی:
+
+```bash
+poltunnel
+```
+
 **یا دستی:** باینری‌های لینوکس در `dist/` هستند (`pol-linux-amd64`، `pol-linux-arm64`). برای build:
 
 ```bash
