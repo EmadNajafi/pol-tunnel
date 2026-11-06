@@ -32,14 +32,16 @@
 
 ```
 Handshake (روی هر اتصال):
-  S→C  "POL1" | nonce[32]
-  C→S  kind[1] | HMAC-SHA256(token, "pol-c"|nonce|kind)
-  S→C  HMAC-SHA256(token, "pol-s"|nonce|kind)        ← احراز هویت دوطرفه
+  S→C  "POL2" | sFlags[1] | sEphPub[32] | nonce[32]
+  C→S  kind[1] | cFlags[1] | cEphPub[32] | HMAC-SHA256(token, "pol-c"|transcript)
+  S→C  HMAC-SHA256(token, "pol-s"|transcript)        ← احراز هویت دوطرفه
+  transcript = nonce | kind | sFlags | cFlags | sEphPub | cEphPub
   توکن غلط ⇒ سرور ساکت می‌ماند و اتصال را می‌بندد.
+  اگر هر دو طرف encryption بخواهند ⇒ X25519 + HKDF ⇒ AES-256-GCM
 
 kind: 1=control  2=data(pool)  3=mux session
 
-Open header:  proto[1] (1=tcp 2=udp) | len[1] | "host:port"
+Open header:  proto[1] (1=tcp 2=udp) | tlen[1] | target | slen[1] | src
 Mux frame:    cmd[1] | streamID[4] | len[2] | payload
               SYN, DATA, FIN(half-close), RST, WND(flow control), PING, PONG
 UDP روی stream:  len[2] | datagram
@@ -64,7 +66,7 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/EmadNajafi/pol-tunnel/m
 poltunnel
 ```
 
-**یا دستی:** باینری‌های لینوکس در `dist/` هستند (`pol-linux-amd64`، `pol-linux-arm64`). برای build:
+**یا دستی:** باینری‌های لینوکس (`pol-linux-amd64`، `pol-linux-arm64`) به‌همراه `SHA256SUMS` در [Releases](https://github.com/EmadNajafi/pol-tunnel/releases) هستند (اسکریپت نصب checksum را خودش بررسی می‌کند). یا خودتان build کنید:
 
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o pol .
@@ -76,23 +78,42 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o pol
 ./pol -c client.toml      # روی سرور خارج
 ```
 
-**تست زنده‌ی همه‌ی تانل‌ها بین دو سرور** (هر تانل واقعی — ۶ ریورس + spoof/spoofmux + direct — را عملاً بالا می‌آورد، لایو روی هر دو سرور نشان می‌دهد، و آخر می‌گوید کدام‌ها اجرا می‌شوند؛ در منو: گزینه «Test tunnels»):
+### Connection Test — کدام تانل‌ها بین این دو سرور واقعاً کار می‌کنند
 
-```bash
-# روی سروری که میزبان تانل می‌شود (مثلاً ایران):
-./pol -test-agent :46000
-# روی سرور دیگر:
-./pol -test-run HOST_IP:46000
+اینکه یک ترنسپورت بین دو سرور مشخص کار می‌کند یا نه، به **مسیر** بستگی دارد نه به برنامه: بعضی مسیرها هر اتصال جدید را بعد از چند پکت قطع می‌کنند، بعضی UDP را می‌بندند، بعضی TLS را ریست می‌کنند. تنها راه مطمئن این است که هر تانل را واقعاً روی مسیر اجرا کنی — Connection Test همین کار را می‌کند (مثل گزینه‌ی Connection Test در بک‌پک):
+
+1. **روی سرور ایران** (منو ← `6) Connection Test` ← `Iran`، یا مستقیم):
+   ```bash
+   sudo pol -conntest                      # آدرس عمومی خودکار؛ یا: -conntest-host PUBLIC_IP
+   ```
+   برای **هر ترنسپورت** (tcp, tcpmux, ws, wsmux, wss, wssmux, spoof, spoofmux) و **تانل direct (L3)** یک موتور واقعی pol روی پورت آزاد بالا می‌آید و یک **لینک کوتاه** چاپ می‌شود، مثل `pol://t.AV2DoBhODzOj-SbrzyNqCmMAAQ`.
+2. **روی سرور خارج** (منو ← `Kharej` ← لینک را paste کن، یا):
+   ```bash
+   sudo pol -conntest-join 'pol://t....'
+   ```
+   تنظیمات تست را از ایران می‌گیرد، سمت خودش همه‌ی تانل‌ها و یک سرویس echo را بالا می‌آورد.
+3. سرور ایران از **همه‌ی تانل‌ها هم‌زمان** ترافیک رد می‌کند: **هر ثانیه یک echo به مدت یک دقیقه** روی همان اتصال (همان چیزی که کاربر واقعی می‌بیند)، بعد روی تانل‌هایی که همه را رساندند **سرعت دانلود و آپلود** (۴ stream، فقط بایت‌هایی که گیرنده تأیید کرده). اگر هر دو طرف root باشند، **جعل IP** هم در هر دو جهت (ایران→خارج و خارج→ایران) با منبع `10.10.10.10` بررسی می‌شود.
+4. هر دو سرور جدول زنده و در پایان **حکم** را نشان می‌دهند: 🟢 **OK** (همه‌ی echoها رسید)، 🟡 **UNSTABLE** (افت داشت — با زمان اولین قطعی)، 🔴 **DOWN** (اصلاً بالا نیامد یا هیچ چیزی رد نکرد)، ⚪ **SKIPPED** (با دلیل). بعد لیست «Works steadily» با RTT و سرعت، توضیح هر خطا، و جدول **BEST SETTINGS** (ترنسپورت پیشنهادی، `mux_window` بر اساس سرعت×RTT، `heartbeat` و `keepalive_period` بر اساس RTT/افت).
+5. **هیچ چیزی باقی نمی‌ماند**: موتورها، کانفیگ‌های موقت و اینترفیس‌های تست بعد از پایان (یا Ctrl+C) پاک می‌شوند.
+
 ```
-خروجی سمت runner:
+VERDICT — Iran ⇄ kharej
+RESULT   KIND      NAME         STATUS    ECHOES  PROGRESS
+
+🟢       Reverse   TCP          OK        60/60   ▰▰▰▰▰▰▰▰ 100%
+🟢       Reverse   TCP MUX      OK        60/60   ▰▰▰▰▰▰▰▰ 100%
+🟡       Reverse   WS           UNSTABLE  54/60   ▰▰▰▰▰▰▰▱  90%
+🔴       Reverse   SPOOF (UDP)  DOWN      0/60    ▱▱▱▱▱▱▱▱   0%
+🔴       Direct    L3 / UDP     DOWN      0/60    ▱▱▱▱▱▱▱▱   0%
+...
+Notes:
+🟡 Reverse WS: 54 of 60 echoes came back; first loss after 12s
+🔴 Reverse SPOOF (UDP): never carried traffic in 1m0s — UDP looks blocked or throttled on this path
 ```
-  testing tcp       ... ✓
-  testing tcpmux    ... ✓
-  ...
-  testing direct    ... ✓
-── which tunnels run on these two servers ──
-usable: tcp, tcpmux, ws, wsmux, wss, wssmux, spoof, spoofmux, direct
-```
+
+- لینک فقط آدرس coordinator و یک راز ۱۲ بایتی را دارد؛ توکن هر تانل از آن مشتق می‌شود و هر سؤال به coordinator با HMAC روی یک nonce تازه احراز می‌شود، پس کسی که لینک را ندارد نمی‌تواند در تست دخالت کند.
+- تانل direct و چک جعل IP به **root روی لینوکس در هر دو سرور** نیاز دارند؛ بدون آن SKIPPED می‌شوند (`-conntest-direct=false` / `-conntest-spoof=false` برای حذف عمدی).
+- پورت‌ها تصادفی‌اند (۲۰۰۰۰ تا ۳۲۰۰۰)؛ فایروال سرور ایران باید ورودی روی این بازه را اجازه دهد.
 
 **لینک‌تست سریع بین دو سرور** (به سبک Link Test بک‌پک — تأخیر/jitter/loss + پیشنهاد):
 
@@ -161,7 +182,7 @@ systemctl daemon-reload && systemctl enable --now pol
 - **tcpmux**: پیش‌فرض خوب. تعداد اتصال‌ها بین دو سرور ثابت است و سربار handshake برای هر کاربر ندارد.
 - **tcp**: هر کاربر یک اتصال واقعی دارد. برای ترافیک حجیم و تعداد اتصال کم مناسب است.
 - **ws / wsmux**: برای عبور از CDN (مثلاً Cloudflare)؛ با `edge_ip` و دامنه در `remote_addr` / `tls_sni`.
-- **wss / wssmux**: رمزنگاری TLS. بدون `tls_cert` یک گواهی self-signed ساخته می‌شود.
+- **wss / wssmux**: رمزنگاری TLS. بدون `tls_cert` یک گواهی self-signed ساخته می‌شود. با گواهی self-signed (`tls_insecure = true`) هویت سرور با TLS بررسی نمی‌شود؛ احراز هویت با توکن همچنان امن است، ولی کسی که وسط مسیر باشد می‌تواند لایه‌ی TLS را باز کند. برای محرمانگی کامل `encryption = true` را هم روشن کنید (کلیدش به توکن گره خورده است).
 - **spoof / spoofmux**: روی UDP با لایه‌ی اطمینان‌پذیری ARQ (شبیه KCP)، با قابلیت **جعل IP مبدأ**. بخش ۷ را ببینید.
 
 ### رمزنگاری روی هر ترنسپورت (`encryption = true`)
@@ -215,6 +236,8 @@ remote_addrs = ["5.6.7.8:443", "example.com:443"]
 علاوه بر تونل معکوس، pol یک **حالت دایرکت** دارد: یک اینترفیس **TUN لایه‌۳** روی هر طرف که **کل بسته‌های IP** را می‌برد (نه فقط چند پورت). مثل حالت direct در BackPack.
 
 - **رمزنگاری:** یک دست‌دادنِ شبیه Noise — تبادل کلید **X25519** (forward secrecy) با احراز هویت توسط توکن (HMAC)، بعد **AES-256-GCM** روی هر بسته. همه با کتابخانه‌ی استاندارد Go.
+- **ضد-replay در دست‌دادن:** پیام INIT برچسب زمانی دارد (حداکثر ±۱۲۰ ثانیه اختلاف ساعت — ساعت سرورها را با NTP همگام نگه دارید) و سرور INITهای تکراری را رد می‌کند. کلیدهای جدید فقط بعد از رسیدن اولین بسته‌ی DATA معتبر جایگزین می‌شوند، پس یک INIT ضبط‌شده نمی‌تواند تونل را قطع کند یا مسیرش را عوض کند.
+- **keepalive و اتصال مجدد:** هر دو طرف هر ۱۰ ثانیه یک بسته‌ی خالی رمزشده می‌فرستند؛ اگر کلاینت ۴۵ ثانیه چیزی نگیرد (مثلاً سرور ری‌استارت شده) دوباره دست می‌دهد.
 - **حمل‌ونقل:** UDP (هر بسته‌ی IP داخل یک دیتاگرام رمزشده).
 - **MTU:** پیش‌فرض ۱۴۰۰ تا بعد از سربار IP/UDP/nonce/tag جا شود.
 - فقط یک آدرس point-to-point اضافه می‌کند؛ **مسیر default را دست نمی‌زند**، پس به شبکه‌ی موجود سرور آسیب نمی‌زند.
@@ -238,6 +261,8 @@ sudo ./pol -c direct-client.toml   # روی سرور دیگر
 | `spoof.go` | ترنسپورت spoof: demux بر اساس connID، listener/dialer |
 | `rawsend_linux.go` / `rawsend_other.go` | ارسال با IP مبدأ جعلی (raw socket، فقط لینوکس) |
 | `direct.go` / `direct_crypto.go` | حالت دایرکت L3: موتور تونل، دست‌دادن X25519 و AES-GCM |
+| `conntest.go` / `conntestboard.go` | Connection Test: اجرای واقعی همه‌ی تانل‌ها بین دو سرور، coordinator، echo/سرعت، جدول زنده و حکم |
+| `probe.go` | Link Test: تأخیر/jitter/افت روی TCP و UDP، چک جعل IP، پیشنهاد ترنسپورت |
 | `tun_linux.go` / `tun_other.go` | اینترفیس TUN لایه‌۳ (فقط لینوکس) |
 | `mux.go` | مالتی‌پلکسر با flow control و half-close |
 | `websocket.go` | پیاده‌سازی مینیمال RFC 6455 (کلاینت و سرور) |

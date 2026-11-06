@@ -18,16 +18,18 @@ import (
 // ---- logging ----
 
 var levels = map[string]int{"debug": 0, "info": 1, "warn": 2, "error": 3}
-var logLevel = 1
+var logLevel atomic.Int32 // read from many goroutines; set at startup (and by tests)
+
+func init() { logLevel.Store(1) }
 
 func setLogLevel(l string) {
 	if v, ok := levels[l]; ok {
-		logLevel = v
+		logLevel.Store(int32(v))
 	}
 }
 
 func logf(level, format string, args ...any) {
-	if levels[level] >= logLevel {
+	if int32(levels[level]) >= logLevel.Load() {
 		log.Printf("[%s] %s", level, fmt.Sprintf(format, args...))
 	}
 }

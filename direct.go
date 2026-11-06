@@ -27,13 +27,32 @@ type directEngine struct {
 	tun  *tunDevice
 	sock *net.UDPConn
 
-	mu        sync.RWMutex
-	keys      *directKeys
-	replay    *replayWindow
-	peerAddr  *net.UDPAddr
-	up        bool
+	mu       sync.RWMutex
+	keys     *directKeys   // active session keys
+	replay   *replayWindow // anti-replay state for the active keys
+	peerAddr *net.UDPAddr
+	up       bool
+	lastRecv time.Time // last authenticated DATA (incl. keepalives)
+	lastSent time.Time
+
+	// client
 	clientEph *ecdh.PrivateKey
+	initMsg   []byte
+	initAt    time.Time
+
+	// server
+	pending       *directKeys   // keys from the newest INIT, promoted on first DATA
+	pendingReplay *replayWindow // anti-replay state for the pending keys
+	seenInit      map[[x25519Len]byte]time.Time
+	lastInitPub   [x25519Len]byte
+	lastResp      []byte
 }
+
+const (
+	directKeepalive   = 10 * time.Second // empty DATA packet when idle (also keeps NAT open)
+	directDeadAfter   = 45 * time.Second // client re-handshakes after this much silence
+	directInitRefresh = 30 * time.Second // client makes a fresh INIT (new key + timestamp)
+)
 
 func RunDirect(cfg *DirectConfig) error {
 	if cfg.MTU == 0 {
@@ -49,7 +68,7 @@ func RunDirect(cfg *DirectConfig) error {
 	}
 	logf("info", "direct: interface %s up (%s peer %s, mtu %d)", tun.name, cfg.LocalIP, cfg.PeerIP, cfg.MTU)
 
-	e := &directEngine{cfg: cfg, tun: tun}
+	e := &directEngine{cfg: cfg, tun: tun, seenInit: map[[x25519Len]byte]time.Time{}}
 	if cfg.Role == "server" {
 		addr, err := net.ResolveUDPAddr("udp", cfg.BindAddr)
 		if err != nil {
@@ -68,50 +87,65 @@ func RunDirect(cfg *DirectConfig) error {
 			return err
 		}
 		e.peerAddr = raddr
-		go e.clientHandshakeLoop(raddr)
 	}
 	e.sock.SetReadBuffer(4 << 20)
 	e.sock.SetWriteBuffer(4 << 20)
 
+	go e.maintain()
 	go e.tunToUDP()
 	e.udpToTun() // blocks
 	return nil
 }
 
-func (e *directEngine) setKeys(k *directKeys, peer *net.UDPAddr) {
+// sendData seals p (empty p = keepalive) with the active keys and sends it.
+func (e *directEngine) sendData(p []byte) {
+	e.mu.RLock()
+	k, peer, up := e.keys, e.peerAddr, e.up
+	e.mu.RUnlock()
+	if !up || k == nil || peer == nil {
+		return // tunnel not established yet: drop (IP will retransmit)
+	}
+	pkt := append([]byte{dirDATA}, k.send.seal(p)...)
+	e.sock.WriteToUDP(pkt, peer)
 	e.mu.Lock()
-	e.keys = k
-	e.replay = &replayWindow{} // fresh anti-replay state per handshake
-	if peer != nil {
-		e.peerAddr = peer
-	}
-	wasUp := e.up
-	e.up = true
+	e.lastSent = time.Now()
 	e.mu.Unlock()
-	if !wasUp {
-		logf("info", "direct: tunnel established with %v", peer)
-	}
 }
 
-// client: send INIT until the server answers with RESP.
-func (e *directEngine) clientHandshakeLoop(peer *net.UDPAddr) {
-	eph, err := genEphemeral()
-	if err != nil {
-		logf("error", "direct: %v", err)
-		return
-	}
-	e.mu.Lock()
-	e.clientEph = eph
-	e.mu.Unlock()
-	initMsg := makeInit(e.cfg.Token, eph.PublicKey().Bytes())
+// maintain runs once a second: the client (re)sends INIT until established and
+// re-handshakes when the peer goes silent; both sides send keepalives.
+func (e *directEngine) maintain() {
 	for {
-		e.mu.RLock()
-		up := e.up
-		e.mu.RUnlock()
-		if up {
-			return
+		now := time.Now()
+		e.mu.Lock()
+		up, lastRecv, lastSent := e.up, e.lastRecv, e.lastSent
+		if e.cfg.Role != "server" && up && now.Sub(lastRecv) > directDeadAfter {
+			logf("warn", "direct: no packets from peer for %v, re-handshaking", directDeadAfter)
+			e.up, e.keys, e.replay, e.clientEph, e.initMsg = false, nil, nil, nil, nil
+			up = false
 		}
-		e.sock.WriteToUDP(initMsg, peer)
+		var initMsg []byte
+		var peer *net.UDPAddr
+		if e.cfg.Role != "server" && !up {
+			if e.initMsg == nil || now.Sub(e.initAt) > directInitRefresh {
+				eph, err := genEphemeral()
+				if err != nil {
+					e.mu.Unlock()
+					logf("error", "direct: %v", err)
+					time.Sleep(time.Second)
+					continue
+				}
+				e.clientEph, e.initMsg, e.initAt = eph, makeInit(e.cfg.Token, eph.PublicKey().Bytes(), now), now
+			}
+			initMsg, peer = e.initMsg, e.peerAddr
+		}
+		e.mu.Unlock()
+
+		if initMsg != nil {
+			e.sock.WriteToUDP(initMsg, peer)
+		} else if up && now.Sub(lastSent) >= directKeepalive {
+			e.sendData(nil)
+		}
 		time.Sleep(time.Second)
 	}
 }
@@ -124,15 +158,26 @@ func (e *directEngine) tunToUDP() {
 			logf("error", "direct: tun read: %v", err)
 			return
 		}
-		e.mu.RLock()
-		k, peer, up := e.keys, e.peerAddr, e.up
-		e.mu.RUnlock()
-		if !up || k == nil || peer == nil {
-			continue // tunnel not established yet: drop (IP will retransmit)
-		}
-		pkt := append([]byte{dirDATA}, k.send.seal(buf[:n])...)
-		e.sock.WriteToUDP(pkt, peer)
+		e.sendData(buf[:n])
 	}
+}
+
+// openData authenticates a DATA packet against keys k and replay window rw.
+func openData(k *directKeys, rw *replayWindow, sealed []byte) ([]byte, bool) {
+	if k == nil {
+		return nil, false
+	}
+	plain, err := k.recv.open(sealed)
+	if err != nil {
+		return nil, false
+	}
+	// the counter lives in the authenticated nonce (sealed[4:12]); drop replays
+	ctr := binary.BigEndian.Uint64(sealed[4:gcmNonce])
+	if rw != nil && !rw.check(ctr) {
+		logf("debug", "direct: dropped replayed/old packet %d", ctr)
+		return nil, false
+	}
+	return plain, true
 }
 
 func (e *directEngine) udpToTun() {
@@ -148,39 +193,96 @@ func (e *directEngine) udpToTun() {
 		}
 		switch buf[0] {
 		case dirINIT:
-			e.handleInit(buf[:n], src)
+			if e.cfg.Role == "server" {
+				e.handleInit(buf[:n], src)
+			}
 		case dirRESP:
-			e.handleResp(buf[:n])
+			if e.cfg.Role != "server" {
+				e.handleResp(buf[:n])
+			}
 		case dirDATA:
-			e.mu.RLock()
-			k, rw := e.keys, e.replay
-			e.mu.RUnlock()
-			if k == nil || n < 1+gcmNonce+gcmTag {
+			if n < 1+gcmNonce+gcmTag {
 				continue
 			}
-			plain, err := k.recv.open(buf[1:n])
-			if err != nil {
-				logf("debug", "direct: decrypt failed: %v", err)
-				continue
+			plain, ok := e.handleData(buf[1:n], src)
+			if ok && len(plain) > 0 { // empty = keepalive
+				e.tun.Write(plain)
 			}
-			// the counter lives in the authenticated nonce (sealed[4:12]); drop replays
-			ctr := binary.BigEndian.Uint64(buf[1+4 : 1+gcmNonce])
-			if rw != nil && !rw.check(ctr) {
-				logf("debug", "direct: dropped replayed/old packet %d", ctr)
-				continue
-			}
-			e.tun.Write(plain)
 		}
 	}
 }
 
-// server side: got an INIT, answer RESP and derive keys (responder).
+func (e *directEngine) handleData(sealed []byte, src *net.UDPAddr) ([]byte, bool) {
+	e.mu.RLock()
+	k, rw, pk, prw := e.keys, e.replay, e.pending, e.pendingReplay
+	e.mu.RUnlock()
+
+	plain, ok := openData(k, rw, sealed)
+	promoted := false
+	if !ok && pk != nil {
+		// first packet under the keys of a fresh handshake: switch to them
+		if plain, ok = openData(pk, prw, sealed); ok {
+			promoted = true
+		}
+	}
+	if !ok {
+		logf("debug", "direct: dropped unauthenticated packet from %v", src)
+		return nil, false
+	}
+	e.mu.Lock()
+	if promoted && e.pending == pk {
+		e.keys, e.replay = pk, prw
+		e.pending, e.pendingReplay = nil, nil
+		if !e.up {
+			logf("info", "direct: tunnel established with %v", src)
+		} else {
+			logf("info", "direct: peer %v re-keyed", src)
+		}
+		e.up = true
+	}
+	if e.cfg.Role == "server" {
+		// roaming: follow the peer's address, but only for authenticated, fresh packets
+		e.peerAddr = src
+	}
+	e.lastRecv = time.Now()
+	e.mu.Unlock()
+	return plain, true
+}
+
+// server side: got an INIT, answer RESP and stage the new keys (responder).
+// The active session is untouched until a DATA packet proves the initiator
+// holds the new keys, so a replayed or stray INIT cannot break the tunnel.
 func (e *directEngine) handleInit(msg []byte, src *net.UDPAddr) {
-	initPub, err := parseInit(e.cfg.Token, msg)
+	now := time.Now()
+	initPub, err := parseInit(e.cfg.Token, msg, now)
 	if err != nil {
 		logf("debug", "direct: bad INIT from %v: %v", src, err)
 		return
 	}
+	var pub [x25519Len]byte
+	copy(pub[:], initPub)
+
+	e.mu.Lock()
+	if pub == e.lastInitPub && e.lastResp != nil {
+		// retransmitted INIT (our RESP was lost): resend the same RESP, keep keys
+		resp := e.lastResp
+		e.mu.Unlock()
+		e.sock.WriteToUDP(resp, src)
+		return
+	}
+	if _, seen := e.seenInit[pub]; seen {
+		e.mu.Unlock()
+		logf("debug", "direct: dropped replayed INIT from %v", src)
+		return
+	}
+	for p, t := range e.seenInit {
+		if now.Sub(t) > 2*initMaxSkew {
+			delete(e.seenInit, p)
+		}
+	}
+	e.seenInit[pub] = now
+	e.mu.Unlock()
+
 	eph, err := genEphemeral()
 	if err != nil {
 		return
@@ -193,17 +295,23 @@ func (e *directEngine) handleInit(msg []byte, src *net.UDPAddr) {
 	if err != nil {
 		return
 	}
-	e.sock.WriteToUDP(makeResp(e.cfg.Token, initPub, eph.PublicKey().Bytes()), src)
-	e.setKeys(keys, src)
+	resp := makeResp(e.cfg.Token, initPub, eph.PublicKey().Bytes())
+
+	e.mu.Lock()
+	e.pending, e.pendingReplay = keys, &replayWindow{}
+	e.lastInitPub, e.lastResp = pub, resp
+	e.mu.Unlock()
+	e.sock.WriteToUDP(resp, src)
 }
 
-// client side: got RESP, derive keys (initiator).
+// client side: got RESP, derive keys (initiator) and confirm with a keepalive
+// so the server switches to the new keys.
 func (e *directEngine) handleResp(msg []byte) {
 	e.mu.RLock()
-	eph := e.clientEph
+	eph, up := e.clientEph, e.up
 	e.mu.RUnlock()
-	if eph == nil {
-		return
+	if eph == nil || up {
+		return // no handshake in progress (or a duplicate RESP)
 	}
 	respPub, err := parseResp(e.cfg.Token, eph.PublicKey().Bytes(), msg)
 	if err != nil {
@@ -218,5 +326,14 @@ func (e *directEngine) handleResp(msg []byte) {
 	if err != nil {
 		return
 	}
-	e.setKeys(keys, nil)
+	e.mu.Lock()
+	if e.up || e.clientEph != eph {
+		e.mu.Unlock()
+		return
+	}
+	e.keys, e.replay = keys, &replayWindow{}
+	e.up, e.lastRecv = true, time.Now()
+	e.mu.Unlock()
+	logf("info", "direct: tunnel established with %v", e.peerAddr)
+	e.sendData(nil) // lets the server promote the new keys right away
 }

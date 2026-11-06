@@ -44,12 +44,11 @@ func (a *aeadConn) Write(p []byte) (int, error) {
 			n = aeadMaxRecord
 		}
 		sealed := a.keys.send.seal(p[:n]) // nonce[12] | ct+tag
-		hdr := make([]byte, 2)
-		binary.BigEndian.PutUint16(hdr, uint16(len(sealed)))
-		if _, err := a.Conn.Write(hdr); err != nil {
-			return total, err
-		}
-		if _, err := a.Conn.Write(sealed); err != nil {
+		// one write per record: len[2] | sealed (avoids a tiny separate packet)
+		rec := make([]byte, 2+len(sealed))
+		binary.BigEndian.PutUint16(rec, uint16(len(sealed)))
+		copy(rec[2:], sealed)
+		if _, err := a.Conn.Write(rec); err != nil {
 			return total, err
 		}
 		total += n

@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -37,15 +38,20 @@ type packetSender interface {
 
 type plainSender struct{ c *net.UDPConn }
 
-func (p plainSender) sendTo(b []byte, dst *net.UDPAddr) error { _, err := p.c.WriteToUDP(b, dst); return err }
-func (p plainSender) Close() error                           { return nil }
+func (p plainSender) sendTo(b []byte, dst *net.UDPAddr) error {
+	_, err := p.c.WriteToUDP(b, dst)
+	return err
+}
+func (p plainSender) Close() error { return nil }
 
 // newSpoofSender returns a forging sender when src != "" (Linux only).
 // newSpoofSender is defined per-OS in rawsend_linux.go / rawsend_other.go.
 
 type spoofConn struct {
-	arq      *arqConn
-	lastAddr *net.UDPAddr // learned source (used only when peerAddr is unset)
+	arq *arqConn
+	// learned source (used only when peerAddr is unset). Written by the read
+	// loop and read by the ARQ sender goroutine, hence atomic.
+	lastAddr atomic.Pointer[net.UDPAddr]
 }
 
 type spoofEndpoint struct {
@@ -78,12 +84,13 @@ func (e *spoofEndpoint) replyTarget(sc *spoofConn) *net.UDPAddr {
 	if e.peerAddr != nil {
 		return e.peerAddr
 	}
-	return sc.lastAddr
+	return sc.lastAddr.Load()
 }
 
 // newConn builds a spoofConn whose arqConn send callback frames + routes output.
 func (e *spoofEndpoint) newConn(id uint32, peer *net.UDPAddr) *spoofConn {
-	sc := &spoofConn{lastAddr: peer}
+	sc := &spoofConn{}
+	sc.lastAddr.Store(peer)
 	local := e.sock.LocalAddr()
 	remote := net.Addr(peer)
 	if e.peerAddr != nil {
@@ -139,7 +146,7 @@ func (e *spoofEndpoint) readLoop() {
 			e.watch(id, sc)
 		} else {
 			if e.peerAddr == nil {
-				sc.lastAddr = addr
+				sc.lastAddr.Store(addr)
 			}
 			e.mu.Unlock()
 		}
@@ -232,9 +239,9 @@ func listenSpoof(cfg *ServerConfig) (TransportListener, error) {
 
 func newSpoofDialer(cfg *ClientConfig) Dialer {
 	var (
-		once   sync.Once
-		ep     *spoofEndpoint
-		remote *net.UDPAddr
+		once    sync.Once
+		ep      *spoofEndpoint
+		remote  *net.UDPAddr
 		initErr error
 	)
 	start := func() {

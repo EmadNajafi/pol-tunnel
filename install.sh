@@ -40,17 +40,40 @@ gen_token() {
 
 # ---------- install / update ----------
 do_install() {
-  local arch url tmp
+  local arch base url tmp sums want got
   arch="$(detect_arch)"
-  url="https://github.com/$REPO/releases/${VERSION_TAG}/download/pol-linux-$arch"
-  [ "$VERSION_TAG" = latest ] && url="https://github.com/$REPO/releases/latest/download/pol-linux-$arch"
+  if [ "$VERSION_TAG" = latest ]; then
+    base="https://github.com/$REPO/releases/latest/download"
+  else
+    base="https://github.com/$REPO/releases/download/$VERSION_TAG"
+  fi
+  url="$base/pol-linux-$arch"
   say "downloading pol ($arch) ..."
-  tmp="$(mktemp)"
+  # temp file next to the target: same filesystem, and not on a noexec /tmp
+  tmp="$(mktemp "$BIN.XXXXXX")"; sums="$(mktemp)"
   if ! curl -fsSL "$url" -o "$tmp"; then
     err "download failed from $url"
+    rm -f "$tmp" "$sums"; return 1
+  fi
+  # verify against the release's SHA256SUMS (catches truncated/corrupted downloads)
+  if curl -fsSL "$base/SHA256SUMS" -o "$sums" 2>/dev/null && [ -s "$sums" ]; then
+    want="$(awk -v f="pol-linux-$arch" '$2==f || $2=="*"f {print $1}' "$sums")"
+    got="$(sha256sum "$tmp" | awk '{print $1}')"
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then
+      err "checksum mismatch for pol-linux-$arch (expected ${want:-none}, got $got) — not installing"
+      rm -f "$tmp" "$sums"; return 1
+    fi
+    ok "checksum verified"
+  else
+    warn "this release has no SHA256SUMS; skipping checksum verification"
+  fi
+  rm -f "$sums"
+  chmod 0755 "$tmp"
+  if ! "$tmp" -version >/dev/null 2>&1; then
+    err "downloaded file is not a working pol binary — not installing"
     rm -f "$tmp"; return 1
   fi
-  install -m 0755 "$tmp" "$BIN"; rm -f "$tmp"
+  mv -f "$tmp" "$BIN"   # atomic replace, safe while a service runs the old one
   mkdir -p "$CFGDIR"
   ok "installed $("$BIN" -version) at $BIN"
   # install this manager as the `poltunnel` command (atomic replace so it is
@@ -279,27 +302,36 @@ do_delete() {
 # tunnel test between two servers
 do_conntest() {
   ensure_installed
-  say "Tunnel test — needs BOTH servers. Pick the agent side first."
+  say "${C_B}Connection Test${C_RESET} — runs every tunnel between this server and another for real"
+  say "and shows which carry traffic steadily, which drop, and which never come up,"
+  say "with round trip and speed. Nothing is installed; the test tunnels are gone when it ends."
   say ""
-  say "  FULL live test (actually builds every tunnel, shows which run):"
-  say "    1) AGENT        — run on the server that will HOST the tunnel (e.g. Iran)"
-  say "    2) RUN the test — run on the OTHER server (needs the agent's IP)"
-  say ""
-  say "  QUICK link test (latency / jitter / loss + a recommendation):"
-  say "    3) listener     — on the tunnel-host server"
-  say "    4) run          — on the other server"
+  say "  This server is:"
+  say "    1) Iran    — start here, get the link"
+  say "    2) Kharej  — paste the Iran server's link"
+  local c; read -rp "choice [1]: " c; c=${c:-1}
+  case "$c" in
+    1) local host def; def="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}')"
+       read -rp "this server's public IP (the kharej dials it) [${def:-auto}]: " host; host=${host:-$def}
+       [ "$(id -u)" -eq 0 ] || warn "not root — the direct tunnel and IP-spoofing check are left out"
+       "$BIN" -conntest ${host:+-conntest-host "$host"} ;;
+    2) local link; read -rp "test link: " link
+       [ -z "$link" ] && { err "no link"; return 1; }
+       "$BIN" -conntest-join "$link" ;;
+  esac
+}
+
+do_linktest() {
+  ensure_installed
+  say "${C_B}Link Test${C_RESET} — latency / jitter / loss over TCP and UDP, forged-source check, and a recommendation"
+  say "    1) listener — on the tunnel-host server (Iran)"
+  say "    2) run      — on the other server (kharej)"
   local c; read -rp "choice [2]: " c; c=${c:-2}
   case "$c" in
-    1) local p; read -rp "agent control port [46000]: " p; p=${p:-46000}
-       say "agent up on :$p — now run option 2 on the other server; Ctrl-C here when done"
-       "$BIN" -test-agent ":$p" ;;
-    2) local a; read -rp "agent address (HOST_SERVER_IP:46000): " a
-       [ -z "$a" ] && { err "no address"; return 1; }
-       "$BIN" -test-run "$a" ;;
-    3) local p; read -rp "listen port [7000]: " p; p=${p:-7000}
-       say "listening on :$p — run option 4 on the other server, then Ctrl-C"
+    1) local p; read -rp "listen port [7000]: " p; p=${p:-7000}
+       say "listening on :$p — run option 2 on the other server, then Ctrl-C"
        "$BIN" -probe-listen ":$p" ;;
-    4) local peer; read -rp "listener address (OTHER_SERVER_IP:7000): " peer
+    2) local peer; read -rp "listener address (OTHER_SERVER_IP:7000): " peer
        [ -z "$peer" ] && { err "no address"; return 1; }
        "$BIN" -probe "$peer" ;;
   esac
@@ -327,8 +359,9 @@ menu() {
     say "  3) Start / stop / restart a tunnel"
     say "  4) Show a tunnel's logs"
     say "  5) Delete a tunnel"
-    say "  6) Test tunnels between two servers (live)"
-    say "  7) Uninstall everything"
+    say "  6) Connection Test — which tunnels work between two servers"
+    say "  7) Link Test — latency / jitter / loss + a recommendation"
+    say "  8) Uninstall everything"
     say "  0) Exit"
     [ -x "$MGR" ] && say "${C_DIM}  (reopen this menu any time with:  poltunnel)${C_RESET}"
     local c; read -rp $'\nchoice: ' c || { echo; exit 0; } # exit cleanly on EOF (non-interactive)
@@ -339,7 +372,8 @@ menu() {
       4) do_logs; pause;;
       5) do_delete; pause;;
       6) do_conntest; pause;;
-      7) do_uninstall; pause;;
+      7) do_linktest; pause;;
+      8) do_uninstall; pause;;
       0|q) exit 0;;
       *) ;;
     esac

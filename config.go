@@ -17,24 +17,24 @@ type Config struct {
 }
 
 type Common struct {
-	Transport     string // tcp | tcpmux | ws | wsmux | wss | wssmux
-	Token         string
-	Keepalive     time.Duration
-	Nodelay       bool
-	Heartbeat     time.Duration
-	MuxFrameSize  int
-	MuxWindow     int
-	WebPort       int
-	LogLevel      string
-	Path          string // websocket path
-	TLSCert       string
-	TLSKey        string
-	TLSSNI        string
-	TLSInsecure   bool
-	ChannelSize   int
-	DialTimeout   time.Duration
-	UDPIdle       time.Duration
-	Encryption    bool // wrap the transport in AES-256-GCM after an X25519 handshake
+	Transport    string // tcp | tcpmux | ws | wsmux | wss | wssmux
+	Token        string
+	Keepalive    time.Duration
+	Nodelay      bool
+	Heartbeat    time.Duration
+	MuxFrameSize int
+	MuxWindow    int
+	WebPort      int
+	LogLevel     string
+	Path         string // websocket path
+	TLSCert      string
+	TLSKey       string
+	TLSSNI       string
+	TLSInsecure  bool
+	ChannelSize  int
+	DialTimeout  time.Duration
+	UDPIdle      time.Duration
+	Encryption   bool // wrap the transport in AES-256-GCM after an X25519 handshake
 }
 
 type ServerConfig struct {

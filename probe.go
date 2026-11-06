@@ -24,6 +24,13 @@ type probeListener struct {
 	src  map[string]string
 }
 
+// Probe datagrams are short tags; the listener ignores anything larger and
+// caps how many tags it remembers, so random traffic can't exhaust memory.
+const (
+	probeMaxTag  = 64
+	probeMaxTags = 4096
+)
+
 func runProbeListen(addr string) error {
 	if !strings.Contains(addr, ":") {
 		addr = ":" + addr
@@ -44,8 +51,15 @@ func runProbeListen(addr string) error {
 			if err != nil {
 				return
 			}
+			if n > probeMaxTag {
+				continue // not one of our probes; don't echo or remember it
+			}
 			tag := string(buf[:n])
 			pl.mu.Lock()
+			if len(pl.seen) >= probeMaxTags {
+				// bound memory against a flood of unique datagrams
+				pl.seen, pl.src = map[string]int{}, map[string]string{}
+			}
 			pl.seen[tag]++
 			pl.src[tag] = from.IP.String()
 			pl.mu.Unlock()
