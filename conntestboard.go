@@ -22,7 +22,8 @@ const ctBarSegments = 8
 
 var ctNames = map[string]string{
 	"tcp": "TCP", "tcpmux": "TCP MUX", "ws": "WS", "wsmux": "WS MUX", "wss": "WSS", "wssmux": "WSS MUX",
-	"spoof": "SPOOF (UDP)", "spoofmux": "SPOOF MUX", "udp": "L3 / UDP",
+	"spoof": "SPOOF (UDP)", "spoofmux": "SPOOF MUX",
+	"udp": "L3 / UDP", "pck": "L3 / TCP (pck)", "sni": "L3 / TCP (sni)", "icmp": "L3 / ICMP",
 	"iran→kharej": "Iran→Kharej", "kharej→iran": "Kharej→Iran",
 }
 
@@ -190,7 +191,7 @@ func ctBestTable(b *ctBest) string {
 
 func ctTransportSetting(b *ctBest) string {
 	if b.Kind == "direct" {
-		return "[direct] mode"
+		return fmt.Sprintf("[direct] mode, carrier %q", b.Transport)
 	}
 	return fmt.Sprintf("%q", b.Transport)
 }

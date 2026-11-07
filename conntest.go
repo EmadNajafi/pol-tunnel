@@ -75,6 +75,16 @@ var (
 // The reverse transports a test covers, in table order.
 var ctReverse = []string{"tcp", "tcpmux", "ws", "wsmux", "wss", "wssmux", "spoof", "spoofmux"}
 
+// The direct-mode carriers a test covers, in table order. All need root on both
+// servers. "spoof" is not here: its only question — does the datacenter allow a
+// forged source — is the one the bidirectional IP Spoof rows already answer,
+// and a direct spoof tunnel would need the server to know the client's real IP
+// before the client connects.
+var ctDirectCarriers = []string{"udp", "pck", "sni", "icmp"}
+
+// ctSNIDomain is the decoy name the sni carrier's ClientHello uses during a test.
+const ctSNIDomain = "www.cloudflare.com"
+
 // ctSpoofSource is the forged source address the IP-spoofing rows probe with.
 const ctSpoofSource = "10.10.10.10"
 
@@ -197,8 +207,10 @@ func ctMAC(secret []byte, nonce, line string) string {
 
 type ctCase struct {
 	Kind string `json:"k"` // reverse | direct
-	Tr   string `json:"t"`
-	Port int    `json:"p"` // reverse: the tunnel port on Iran; direct: its UDP port
+	Tr   string `json:"t"` // reverse: transport; direct: carrier (udp/pck/sni/icmp)
+	Port int    `json:"p"` // reverse: the tunnel port on Iran; direct: its base port
+	L3   *ctL3  `json:"l3,omitempty"`
+	Tun  string `json:"tn,omitempty"` // direct: the TUN interface name
 
 	entry  int // Iran: where the reverse tunnel's users arrive (127.0.0.1)
 	skip   string
@@ -215,7 +227,6 @@ type ctL3 struct {
 type ctConfig struct {
 	Cases    []*ctCase `json:"c"`
 	Echo     int       `json:"e"`            // the kharej's TCP echo the reverse tunnels forward to
-	L3       *ctL3     `json:"l,omitempty"`  // nil: direct not tested (Iran is not root/Linux)
 	SpoofI   int       `json:"si,omitempty"` // Iran's UDP receiver for forged probes
 	SpoofSrc string    `json:"ss,omitempty"`
 	Soak     int       `json:"sk"`
@@ -331,9 +342,14 @@ func ctClientConfig(tr, token, remote string) string {
 		"connection_pool = 4\nretry_interval = 1\n", remote, tr, token)
 }
 
-func ctDirectConfig(role, addrKey, addr, token, local, peer string) string {
-	return fmt.Sprintf("[direct]\nrole = \"%s\"\n%s = \"%s\"\ntoken = \"%s\"\ntun_name = \"polct0\"\n"+
-		"local_ip = \"%s\"\npeer_ip = \"%s\"\nmtu = 1400\nlog_level = \"warn\"\n", role, addrKey, addr, token, local, peer)
+func ctDirectConfig(role, addrKey, addr, token, local, peer, carrier, tun string) string {
+	cfg := fmt.Sprintf("[direct]\nrole = \"%s\"\n%s = \"%s\"\ntoken = \"%s\"\ntun_name = \"%s\"\n"+
+		"local_ip = \"%s\"\npeer_ip = \"%s\"\nmtu = 1400\nauto_mtu = false\ncarrier = \"%s\"\nlog_level = \"warn\"\n",
+		role, addrKey, addr, token, tun, local, peer, carrier)
+	if carrier == "sni" {
+		cfg += fmt.Sprintf("sni_domain = \"%s\"\n", ctSNIDomain)
+	}
+	return cfg
 }
 
 // ---- ports and addresses ----
@@ -363,8 +379,9 @@ func ctPickPort(used map[int]bool) int {
 	return 0
 }
 
-// ctFreeL3 picks a 10.x.y.0/30 pair not already on this server.
-func ctFreeL3() (string, string) {
+// ctFreeL3 picks a 10.x.y.0/30 pair not already on this server and not already
+// handed out this run (taken records the pairs chosen so far).
+func ctFreeL3(taken map[string]bool) (string, string) {
 	addrs, _ := net.InterfaceAddrs()
 	inUse := func(ip net.IP) bool {
 		for _, a := range addrs {
@@ -374,10 +391,15 @@ func ctFreeL3() (string, string) {
 		}
 		return false
 	}
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 200; i++ {
 		x, y := 200+mrand.IntN(50), mrand.IntN(250)
+		key := fmt.Sprintf("%d.%d", x, y)
+		if taken[key] {
+			continue
+		}
 		a, b := net.IPv4(10, byte(x), byte(y), 1), net.IPv4(10, byte(x), byte(y), 2)
 		if !inUse(a) && !inUse(b) {
+			taken[key] = true
 			return a.String(), b.String()
 		}
 	}
@@ -679,18 +701,21 @@ func startCTIran(o ctIranOptions) (*ctIran, error) {
 		c := &ctCase{Kind: "reverse", Tr: tr, Port: ctPickPort(used), entry: ctPickPort(used)}
 		s.cfg.Cases = append(s.cfg.Cases, c)
 	}
-	direct := &ctCase{Kind: "direct", Tr: "udp"}
-	switch {
-	case !o.Direct:
-		direct.skip = "not selected"
-	case !ctCanDirect():
-		direct.skip = "needs root on Linux (this server)"
-	default:
-		direct.Port = ctPickPort(used)
-		a, b := ctFreeL3()
-		s.cfg.L3 = &ctL3{Iran: a, Kharej: b, Echo: ctPickPort(used)}
+	l3Taken := map[string]bool{}
+	for _, car := range ctDirectCarriers {
+		direct := &ctCase{Kind: "direct", Tr: car, Tun: "polct-" + car}
+		switch {
+		case !o.Direct:
+			direct.skip = "not selected"
+		case !ctCanDirect():
+			direct.skip = "needs root on Linux (this server)"
+		default:
+			direct.Port = ctPickPort(used)
+			a, b := ctFreeL3(l3Taken)
+			direct.L3 = &ctL3{Iran: a, Kharej: b, Echo: ctPickPort(used)}
+		}
+		s.cfg.Cases = append(s.cfg.Cases, direct)
 	}
-	s.cfg.Cases = append(s.cfg.Cases, direct)
 
 	for _, c := range s.cfg.Cases {
 		s.cases = append(s.cases, c)
@@ -733,7 +758,7 @@ func startCTIran(o ctIranOptions) (*ctIran, error) {
 		tok := ctToken(secret, c.Kind, c.Tr)
 		var cfg string
 		if c.Kind == "direct" {
-			cfg = ctDirectConfig("server", "bind_addr", fmt.Sprintf("0.0.0.0:%d", c.Port), tok, s.cfg.L3.Iran, s.cfg.L3.Kharej)
+			cfg = ctDirectConfig("server", "bind_addr", fmt.Sprintf("0.0.0.0:%d", c.Port), tok, c.L3.Iran, c.L3.Kharej, c.Tr, c.Tun)
 		} else {
 			cfg = ctServerConfig(c.Tr, tok, c.Port, c.entry, s.cfg.Echo)
 		}
@@ -879,7 +904,7 @@ func (s *ctIran) waitFetched(d time.Duration) {
 func (s *ctIran) dial(ctx context.Context, c *ctCase) (net.Conn, error) {
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(c.entry))
 	if c.Kind == "direct" {
-		addr = net.JoinHostPort(s.cfg.L3.Kharej, strconv.Itoa(s.cfg.L3.Echo))
+		addr = net.JoinHostPort(c.L3.Kharej, strconv.Itoa(c.L3.Echo))
 	}
 	return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "tcp", addr)
 }
@@ -935,7 +960,12 @@ func (s *ctIran) probe(ctx context.Context, i int, c *ctCase) {
 		if time.Since(start) > wait {
 			s.set(i, func(r *ctResult) {
 				r.Status, r.Detail = ctDown, fmt.Sprintf("never carried traffic in %s", wait)
-				if c.Kind == "direct" || strings.HasPrefix(c.Tr, "spoof") {
+				switch {
+				case c.Kind == "direct" && c.Tr == "icmp":
+					r.Detail += " — ICMP looks blocked or throttled on this path"
+				case c.Kind == "direct" && (c.Tr == "pck" || c.Tr == "sni"):
+					r.Detail += " — these TCP-shaped packets look blocked on this path"
+				case c.Kind == "direct" || strings.HasPrefix(c.Tr, "spoof"):
 					r.Detail += " — UDP looks blocked or throttled on this path"
 				}
 			})
@@ -1454,7 +1484,7 @@ func ctKharejRun(ctx context.Context, l ctLink, board *ctBoard) ([]ctResult, *ct
 		switch {
 		case c.Kind == "reverse":
 			conf = ctClientConfig(c.Tr, tok, net.JoinHostPort(l.Host, strconv.Itoa(c.Port)))
-		case c.Kind == "direct" && cfg.L3 != nil && root:
+		case c.Kind == "direct" && c.L3 != nil && root:
 			// echo on the tunnel address only, once the engine has configured it
 			go func(addr string) {
 				for i := 0; i < 240 && ctx.Err() == nil; i++ {
@@ -1466,9 +1496,9 @@ func ctKharejRun(ctx context.Context, l ctLink, board *ctBoard) ([]ctResult, *ct
 					}
 					ctSleep(ctx, 500*time.Millisecond)
 				}
-			}(net.JoinHostPort(cfg.L3.Kharej, strconv.Itoa(cfg.L3.Echo)))
+			}(net.JoinHostPort(c.L3.Kharej, strconv.Itoa(c.L3.Echo)))
 			conf = ctDirectConfig("client", "remote_addr", net.JoinHostPort(l.Host, strconv.Itoa(c.Port)), tok,
-				cfg.L3.Kharej, cfg.L3.Iran)
+				c.L3.Kharej, c.L3.Iran, c.Tr, c.Tun)
 		default:
 			continue
 		}
