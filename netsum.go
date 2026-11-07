@@ -139,11 +139,14 @@ func parseTCP(seg []byte) (srcPort, dstPort uint16, flags byte, payload []byte, 
 
 // ---- ICMP (icmp carrier) ----
 
-// buildICMPEcho builds an ICMP echo message (header + payload). We use echo
-// REPLY (type 0) in both directions: the kernel generates nothing in response
-// to an unsolicited reply, so no port, no listener and no firewall rule are
-// needed, and the raw socket still receives a copy.
-const icmpEchoReply = 0
+// buildICMPEcho builds an ICMP echo message (header + payload). The icmp
+// carrier mimics a normal ping — the client sends echo requests and the server
+// sends echo replies — because a stateful path drops an echo reply with no
+// matching request.
+const (
+	icmpEchoReply   = 0
+	icmpEchoRequest = 8
+)
 
 func buildICMPEcho(typ byte, id, seq uint16, payload []byte) []byte {
 	m := make([]byte, 8+len(payload))

@@ -152,18 +152,27 @@ func (p *pckIO) setDF(on bool)  { p.raw.setDF(on) }
 func (p *pckIO) localPort() int { return int(p.port) }
 func (p *pckIO) Close() error   { return p.raw.Close() }
 
-// ---- icmp: echo-reply messages ----
-
+// ---- icmp: echo request (client) / echo reply (server) ----
+//
+// The flow mimics a normal ping: the client sends echo REQUESTS and the server
+// answers with echo REPLIES. This matters because stateful middleboxes drop an
+// echo reply that has no matching request, so echo replies in both directions
+// (which would avoid the kernel's auto-reply) do not survive real paths. The
+// cost of the request direction is that the server's kernel also auto-answers
+// the client's requests; those carry the client's own (i2r-sealed) bytes back,
+// so the client fails to open them and drops them — wasteful but harmless.
 type icmpIO struct {
-	raw *rawIO
-	id  uint16 // this path's ICMP identifier
-	seq atomic.Uint32
+	raw      *rawIO
+	id       uint16 // this path's ICMP identifier
+	seq      atomic.Uint32
+	sendType byte // client: echo request (8); server: echo reply (0)
+	recvType byte // the type the peer sends (opposite of sendType)
 }
 
 func (c *icmpIO) send(payload []byte, dst *net.UDPAddr) error {
 	src := c.raw.srcFor(dst.IP)
 	seq := uint16(c.seq.Add(1))
-	msg := buildICMPEcho(icmpEchoReply, c.id, seq, payload)
+	msg := buildICMPEcho(c.sendType, c.id, seq, payload)
 	pkt := append(ipv4Header(src, dst.IP, ipProtoICMP, len(msg), c.raw.df.Load()), msg...)
 	return c.raw.sendIP(pkt, dst.IP)
 }
@@ -179,7 +188,7 @@ func (c *icmpIO) recv(buf []byte) (int, *net.UDPAddr, error) {
 			continue
 		}
 		typ, id, payload, ok := parseICMPEcho(l4)
-		if !ok || typ != icmpEchoReply || id != c.id || len(payload) == 0 {
+		if !ok || typ != c.recvType || id != c.id || len(payload) == 0 {
 			continue
 		}
 		copy(buf, payload)
@@ -229,12 +238,18 @@ func newRawPaths(cfg *DirectConfig) ([]*directPath, []*net.UDPAddr, func(), erro
 			}})
 		}
 	case "icmp":
+		sendType, recvType := byte(icmpEchoRequest), byte(icmpEchoReply) // client
+		if cfg.Role == "server" {
+			sendType, recvType = icmpEchoReply, icmpEchoRequest
+		}
 		for i := 0; i < cfg.Paths; i++ {
 			raw, err := openRawIO(ipProtoICMP)
 			if err != nil {
 				return fail(err)
 			}
-			paths = append(paths, &directPath{idx: i, io: &icmpIO{raw: raw, id: uint16(base + i)}})
+			paths = append(paths, &directPath{idx: i, io: &icmpIO{
+				raw: raw, id: uint16(base + i), sendType: sendType, recvType: recvType,
+			}})
 		}
 	default:
 		return nil, nil, nil, fmt.Errorf("direct: %q is not a raw carrier", cfg.Carrier)
