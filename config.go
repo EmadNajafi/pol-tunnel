@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -330,6 +331,44 @@ func LoadConfig(path string) (*Config, error) {
 			LocalIP:    sec.str("local_ip", ""),
 			PeerIP:     sec.str("peer_ip", ""),
 			MTU:        sec.num("mtu", 1400),
+
+			Carrier:     strings.ToLower(sec.str("carrier", "udp")),
+			SpoofSource: sec.str("spoof_source", ""),
+			SpoofPeerIP: sec.str("spoof_peer_ip", ""),
+			SNIDomain:   sec.str("sni_domain", ""),
+			Paths:       sec.num("paths", 1),
+			AutoMTU:     sec.boolean("auto_mtu", true),
+		}
+		switch d.Carrier {
+		case "udp", "icmp", "pck":
+			// no carrier-specific required field
+		case "spoof":
+			if net.ParseIP(d.SpoofSource).To4() == nil {
+				return nil, fmt.Errorf("direct carrier \"spoof\" needs spoof_source = an IPv4 address to forge")
+			}
+		case "sni":
+			if d.SNIDomain == "" {
+				return nil, fmt.Errorf("direct carrier \"sni\" needs sni_domain = a domain to name in the TLS ClientHello (one your route already reaches)")
+			}
+		case "tcp", "tcpmux", "ws", "wsmux", "wss", "wssmux", "spoofmux", "kcp", "quic":
+			return nil, fmt.Errorf("direct.carrier %q: reliable/stream carriers are refused on purpose (IP packets inside a reliable stream collapse under loss); use udp, spoof, pck, sni or icmp", d.Carrier)
+		default:
+			return nil, fmt.Errorf("direct.carrier must be one of udp, spoof, pck, sni, icmp; got %q", d.Carrier)
+		}
+		if d.SpoofSource != "" && d.Carrier != "spoof" {
+			return nil, fmt.Errorf("direct.spoof_source only applies to carrier = \"spoof\"")
+		}
+		if d.SNIDomain != "" && d.Carrier != "sni" {
+			return nil, fmt.Errorf("direct.sni_domain only applies to carrier = \"sni\"")
+		}
+		if d.SpoofPeerIP != "" && net.ParseIP(d.SpoofPeerIP).To4() == nil {
+			return nil, fmt.Errorf("direct.spoof_peer_ip %q is not an IPv4 address", d.SpoofPeerIP)
+		}
+		if d.Paths < 1 || d.Paths > directMaxPaths {
+			return nil, fmt.Errorf("direct.paths must be 1..%d", directMaxPaths)
+		}
+		if d.MTU < 576 || d.MTU > 65535-directOverhead {
+			return nil, fmt.Errorf("direct.mtu must be 576..%d", 65535-directOverhead)
 		}
 		if d.Role != "server" && d.Role != "client" {
 			return nil, fmt.Errorf("direct.role must be \"server\" or \"client\"")
@@ -342,6 +381,15 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		if d.Role == "client" && d.RemoteAddr == "" {
 			return nil, fmt.Errorf("direct client needs remote_addr")
+		}
+		portOf := d.BindAddr
+		if d.Role == "client" {
+			portOf = d.RemoteAddr
+		}
+		if _, ps, err := net.SplitHostPort(portOf); err == nil {
+			if p, err := strconv.Atoi(ps); err == nil && p+d.Paths-1 > 65535 {
+				return nil, fmt.Errorf("direct: paths = %d needs ports %d..%d, past 65535", d.Paths, p, p+d.Paths-1)
+			}
 		}
 		cfg.Direct = d
 	}

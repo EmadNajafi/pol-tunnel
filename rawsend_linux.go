@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -18,7 +19,10 @@ type rawSender struct {
 	fd      int
 	srcIP   [4]byte
 	srcPort uint16
+	df      atomic.Bool // set Don't Fragment (direct mode's auto MTU probing)
 }
+
+func (s *rawSender) setDF(on bool) { s.df.Store(on) }
 
 func buildSender(sock *net.UDPConn, spoofSrc, refAddr string) (packetSender, error) {
 	if spoofSrc == "" {
@@ -87,8 +91,12 @@ func (s *rawSender) build(payload, dstIP []byte, dstPort uint16) []byte {
 	b[1] = 0
 	binary.BigEndian.PutUint16(b[2:], uint16(total))
 	binary.BigEndian.PutUint16(b[4:], 0) // id (kernel fills when 0 on many kernels; fine)
-	binary.BigEndian.PutUint16(b[6:], 0) // flags/frag
-	b[8] = 64                            // TTL
+	if s.df.Load() {
+		binary.BigEndian.PutUint16(b[6:], 0x4000) // flags: Don't Fragment
+	} else {
+		binary.BigEndian.PutUint16(b[6:], 0) // flags/frag
+	}
+	b[8] = 64 // TTL
 	b[9] = syscall.IPPROTO_UDP
 	copy(b[12:16], s.srcIP[:])
 	copy(b[16:20], dstIP)
@@ -102,43 +110,4 @@ func (s *rawSender) build(payload, dstIP []byte, dstPort uint16) []byte {
 	copy(u[udpHdr:], payload)
 	binary.BigEndian.PutUint16(u[6:], udpChecksum(s.srcIP[:], dstIP, u))
 	return b
-}
-
-func checksum(b []byte) uint16 {
-	var sum uint32
-	for i := 0; i+1 < len(b); i += 2 {
-		sum += uint32(b[i])<<8 | uint32(b[i+1])
-	}
-	if len(b)%2 == 1 {
-		sum += uint32(b[len(b)-1]) << 8
-	}
-	for sum>>16 != 0 {
-		sum = (sum & 0xffff) + (sum >> 16)
-	}
-	return ^uint16(sum)
-}
-
-func udpChecksum(src, dst, udp []byte) uint16 {
-	var sum uint32
-	add := func(b []byte) {
-		for i := 0; i+1 < len(b); i += 2 {
-			sum += uint32(b[i])<<8 | uint32(b[i+1])
-		}
-		if len(b)%2 == 1 {
-			sum += uint32(b[len(b)-1]) << 8
-		}
-	}
-	add(src)
-	add(dst)
-	sum += uint32(syscall.IPPROTO_UDP)
-	sum += uint32(len(udp))
-	add(udp)
-	for sum>>16 != 0 {
-		sum = (sum & 0xffff) + (sum >> 16)
-	}
-	cs := ^uint16(sum)
-	if cs == 0 {
-		cs = 0xffff // 0 means "no checksum"; avoid it
-	}
-	return cs
 }

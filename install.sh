@@ -225,16 +225,50 @@ do_create() {
       local role=server; [ "$kind" = 4 ] && role=client
       read -rp "this side's tunnel IP [10.200.0.1]: " lip; lip=${lip:-10.200.0.1}
       read -rp "peer's tunnel IP [10.200.0.2]: " pip; pip=${pip:-10.200.0.2}
+      # carrier: how THIS side's outgoing packets look on the wire
+      say "carrier (this side's outgoing packets — all but udp need root on Linux):"
+      say "  1) udp    plain UDP (default)"
+      say "  2) spoof  UDP with a forged source IP (datacenter must allow it — check with Link Test)"
+      say "  3) pck    hand-built TCP segments, no real connection"
+      say "  4) sni    pck, preceded by a TLS ClientHello naming an allowed domain"
+      say "  5) icmp   ICMP echo (use when only ping gets through)"
+      local car spsrc="" sppeer="" sni="" paths amtu
+      read -rp "carrier [1]: " car
+      case "${car:-1}" in 2) car=spoof;; 3) car=pck;; 4) car=sni;; 5) car=icmp;; *) car=udp;; esac
+      if [ "$car" = spoof ]; then
+        read -rp "forged source IP [10.10.10.10]: " spsrc; spsrc=${spsrc:-10.10.10.10}
+      fi
+      if [ "$car" = sni ]; then
+        read -rp "domain to name in the TLS ClientHello (one your route reaches) [www.cloudflare.com]: " sni; sni=${sni:-www.cloudflare.com}
+      fi
+      read -rp "paths — parallel sockets on consecutive ports, SAME on both sides [1]: " paths; paths=${paths:-1}
+      [[ "$paths" =~ ^[0-9]+$ ]] && [ "$paths" -ge 1 ] && [ "$paths" -le 16 ] || { err "paths must be 1..16"; return 1; }
+      amtu=$(ask_yn "measure the route and set the MTU automatically (auto MTU)? [Y/n]:" y && echo true || echo false)
+      direct_opts() {
+        echo "carrier = \"$car\""
+        [ -n "$spsrc" ] && echo "spoof_source = \"$spsrc\""
+        [ -n "$sppeer" ] && echo "spoof_peer_ip = \"$sppeer\""
+        [ -n "$sni" ] && echo "sni_domain = \"$sni\""
+        echo "paths = $paths"
+        echo "auto_mtu = $amtu"
+      }
       if [ "$role" = server ]; then
-        read -rp "UDP bind port [3090]: " dbind; dbind=${dbind:-3090}
+        read -rp "bind port [3090]: " dbind; dbind=${dbind:-3090}
+        read -rp "kharej's REAL IP, only if the kharej side uses carrier spoof (empty = no): " sppeer
         token="$(gen_token)"
         say "generated token (put the SAME token on the client):"
         say "  ${C_CYN}$token${C_RESET}"
+        case "$car" in
+          pck|sni) warn "allow inbound TCP on ports $dbind-$((dbind + paths - 1)) on this server's firewall" ;;
+          icmp)    warn "allow inbound ICMP (echo) on this server's firewall" ;;
+          *)       [ "$paths" -gt 1 ] && warn "open UDP ports $dbind-$((dbind + paths - 1)) on this server's firewall" ;;
+        esac
         {
           echo "[direct]"; echo "role = \"server\""
           echo "bind_addr = \"0.0.0.0:$dbind\""
           echo "token = \"$token\""; echo "tun_name = \"pol-$name\""
           echo "local_ip = \"$lip\""; echo "peer_ip = \"$pip\""; echo "mtu = 1400"
+          direct_opts
           echo "log_level = \"info\""
         } > "$f"
       else
@@ -245,6 +279,7 @@ do_create() {
           echo "remote_addr = \"$dremote\""
           echo "token = \"$token\""; echo "tun_name = \"pol-$name\""
           echo "local_ip = \"$lip\""; echo "peer_ip = \"$pip\""; echo "mtu = 1400"
+          direct_opts
           echo "log_level = \"info\""
         } > "$f"
       fi
