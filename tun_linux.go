@@ -62,6 +62,14 @@ func (t *tunDevice) Read(p []byte) (int, error)  { return t.f.Read(p) }
 func (t *tunDevice) Write(p []byte) (int, error) { return t.f.Write(p) }
 func (t *tunDevice) Close() error                { return t.f.Close() }
 
+// setMTU changes the interface MTU (direct mode's auto MTU).
+func (t *tunDevice) setMTU(mtu int) error {
+	if out, err := exec.Command("ip", "link", "set", "dev", t.name, "mtu", fmt.Sprint(mtu)).CombinedOutput(); err != nil {
+		return fmt.Errorf("ip link set mtu %d: %v (%s)", mtu, err, out)
+	}
+	return nil
+}
+
 // configure brings the interface up with a point-to-point address and MTU,
 // using the `ip` tool. It adds only this /32 peer route, never a default route,
 // so it cannot disturb the host's existing networking.

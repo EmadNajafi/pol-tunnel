@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -330,6 +331,35 @@ func LoadConfig(path string) (*Config, error) {
 			LocalIP:    sec.str("local_ip", ""),
 			PeerIP:     sec.str("peer_ip", ""),
 			MTU:        sec.num("mtu", 1400),
+
+			Carrier:     strings.ToLower(sec.str("carrier", "udp")),
+			SpoofSource: sec.str("spoof_source", ""),
+			SpoofPeerIP: sec.str("spoof_peer_ip", ""),
+			Paths:       sec.num("paths", 1),
+			AutoMTU:     sec.boolean("auto_mtu", true),
+		}
+		switch d.Carrier {
+		case "udp":
+			if d.SpoofSource != "" {
+				return nil, fmt.Errorf("direct.spoof_source needs carrier = \"spoof\"")
+			}
+		case "spoof":
+			if net.ParseIP(d.SpoofSource).To4() == nil {
+				return nil, fmt.Errorf("direct carrier \"spoof\" needs spoof_source = an IPv4 address to forge")
+			}
+		case "tcp", "tcpmux", "ws", "wsmux", "wss", "wssmux", "spoofmux", "kcp":
+			return nil, fmt.Errorf("direct.carrier %q: stream carriers are refused on purpose (IP packets inside a reliable stream collapse under loss); use \"udp\" or \"spoof\"", d.Carrier)
+		default:
+			return nil, fmt.Errorf("direct.carrier must be \"udp\" or \"spoof\", got %q", d.Carrier)
+		}
+		if d.SpoofPeerIP != "" && net.ParseIP(d.SpoofPeerIP).To4() == nil {
+			return nil, fmt.Errorf("direct.spoof_peer_ip %q is not an IPv4 address", d.SpoofPeerIP)
+		}
+		if d.Paths < 1 || d.Paths > directMaxPaths {
+			return nil, fmt.Errorf("direct.paths must be 1..%d", directMaxPaths)
+		}
+		if d.MTU < 576 || d.MTU > 65535-directOverhead {
+			return nil, fmt.Errorf("direct.mtu must be 576..%d", 65535-directOverhead)
 		}
 		if d.Role != "server" && d.Role != "client" {
 			return nil, fmt.Errorf("direct.role must be \"server\" or \"client\"")
@@ -342,6 +372,15 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		if d.Role == "client" && d.RemoteAddr == "" {
 			return nil, fmt.Errorf("direct client needs remote_addr")
+		}
+		portOf := d.BindAddr
+		if d.Role == "client" {
+			portOf = d.RemoteAddr
+		}
+		if _, ps, err := net.SplitHostPort(portOf); err == nil {
+			if p, err := strconv.Atoi(ps); err == nil && p+d.Paths-1 > 65535 {
+				return nil, fmt.Errorf("direct: paths = %d needs ports %d..%d, past 65535", d.Paths, p, p+d.Paths-1)
+			}
 		}
 		cfg.Direct = d
 	}

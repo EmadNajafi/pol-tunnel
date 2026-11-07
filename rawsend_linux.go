@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -18,7 +19,10 @@ type rawSender struct {
 	fd      int
 	srcIP   [4]byte
 	srcPort uint16
+	df      atomic.Bool // set Don't Fragment (direct mode's auto MTU probing)
 }
+
+func (s *rawSender) setDF(on bool) { s.df.Store(on) }
 
 func buildSender(sock *net.UDPConn, spoofSrc, refAddr string) (packetSender, error) {
 	if spoofSrc == "" {
@@ -87,8 +91,12 @@ func (s *rawSender) build(payload, dstIP []byte, dstPort uint16) []byte {
 	b[1] = 0
 	binary.BigEndian.PutUint16(b[2:], uint16(total))
 	binary.BigEndian.PutUint16(b[4:], 0) // id (kernel fills when 0 on many kernels; fine)
-	binary.BigEndian.PutUint16(b[6:], 0) // flags/frag
-	b[8] = 64                            // TTL
+	if s.df.Load() {
+		binary.BigEndian.PutUint16(b[6:], 0x4000) // flags: Don't Fragment
+	} else {
+		binary.BigEndian.PutUint16(b[6:], 0) // flags/frag
+	}
+	b[8] = 64 // TTL
 	b[9] = syscall.IPPROTO_UDP
 	copy(b[12:16], s.srcIP[:])
 	copy(b[16:20], dstIP)

@@ -1,14 +1,21 @@
 # Direct mode (BackPack-style L3 tunnel) — SERVER side (listens).
 # A TUN interface carries raw IP packets, encrypted (X25519 handshake +
-# AES-256-GCM) over UDP. Linux + root only. This side waits for the peer.
+# AES-256-GCM) over a datagram carrier. Linux + root only. This side waits for the peer.
 [direct]
 role = "server"
-bind_addr = "0.0.0.0:3090"     # UDP port the client connects to
+bind_addr = "0.0.0.0:3090"     # UDP port the client connects to (paths > 1: this port and the next ones)
 token = "CHANGE_ME"            # same on both sides (pol -gen-token)
 tun_name = "pol0"
 local_ip = "10.200.0.1"        # this side's tunnel IP
 peer_ip  = "10.200.0.2"        # the other side's tunnel IP
-mtu = 1400
+mtu = 1400                     # starting MTU; auto_mtu replaces it with the measured one
+
+carrier = "udp"                # this side's outgoing packets: "udp" or "spoof" (forged source IP)
+# spoof_source = "10.10.10.10" # carrier = "spoof": the source IP to forge (root, no BCP38 at the datacenter)
+# spoof_peer_ip = "CLIENT_IP"  # only if the CLIENT uses carrier = "spoof": its real IP (replies go here)
+paths = 1                      # UDP sockets on consecutive ports, one flow each; SAME on both sides
+auto_mtu = true                # measure the route and set the interface MTU to match
+
 log_level = "info"
 # After it's up: both machines can reach each other at the tunnel IPs above.
 # e.g. run any service on 10.200.0.1 and reach it from the peer, or add your

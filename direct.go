@@ -3,14 +3,30 @@ package main
 import (
 	"crypto/ecdh"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // DirectConfig is a BackPack-style [direct] engine: a layer-3 point-to-point
 // tunnel. A TUN interface on each side carries raw IP packets, which are
-// encrypted (X25519 handshake + AES-256-GCM) and shipped over UDP to the peer.
+// encrypted (X25519 handshake + AES-256-GCM) and shipped to the peer over a
+// datagram carrier.
+//
+// Carriers (per side — each side picks how its own outgoing packets look):
+//
+//	udp    plain UDP datagrams (default)
+//	spoof  UDP with a forged source IPv4 (raw socket: Linux + root, and a
+//	       datacenter without BCP38 egress filtering)
+//
+// paths = N spreads the tunnel over N UDP sockets on consecutive ports, one
+// inner flow per socket, so a per-flow rate limit on the route applies to
+// each socket separately. Both ends must use the same N.
+//
+// auto_mtu measures the largest packet the route carries (authenticated
+// padded probes, binary search) and sets the interface MTU to match.
 type DirectConfig struct {
 	Role       string // "server" (listens) or "client" (dials)
 	BindAddr   string // server
@@ -19,21 +35,52 @@ type DirectConfig struct {
 	TunName    string
 	LocalIP    string // this side's tunnel IP
 	PeerIP     string // the other side's tunnel IP
-	MTU        int
+	MTU        int    // interface MTU (the starting value when AutoMTU is on)
+
+	Carrier     string // "udp" (default) or "spoof"
+	SpoofSource string // spoof: forge this source IPv4 on outgoing packets
+	SpoofPeerIP string // server: the client's real IPv4, needed when the client forges its source
+	Paths       int    // number of sockets on consecutive ports (multipath); 1 = single socket
+	AutoMTU     bool   // measure the route and set the interface MTU (needs a peer that answers probes)
+}
+
+const (
+	directMaxPaths = 16
+	// directOverhead is what a DATA packet adds to the inner IP packet:
+	// type[1] + nonce[12] + GCM tag[16].
+	directOverhead = 1 + gcmNonce + gcmTag
+)
+
+// l3Device is the packet interface the engine reads from and writes to: the
+// TUN device in production, a fake in tests.
+type l3Device interface {
+	Read([]byte) (int, error)
+	Write([]byte) (int, error)
+	setMTU(int) error
+}
+
+// directPath is one carrier socket. With paths = N there are N of them on
+// consecutive ports.
+type directPath struct {
+	idx      int
+	sock     *net.UDPConn
+	sender   packetSender // plain UDP, or the forging raw sender
+	lastSent atomic.Int64 // unix nanos of the last packet sent on this path
 }
 
 type directEngine struct {
-	cfg  *DirectConfig
-	tun  *tunDevice
-	sock *net.UDPConn
+	cfg       *DirectConfig
+	dev       l3Device
+	paths     []*directPath
+	spoofPeer net.IP // server: send to this IP instead of the (forged) source IP
 
 	mu       sync.RWMutex
 	keys     *directKeys   // active session keys
 	replay   *replayWindow // anti-replay state for the active keys
-	peerAddr *net.UDPAddr
+	peers    []*net.UDPAddr
 	up       bool
 	lastRecv time.Time // last authenticated DATA (incl. keepalives)
-	lastSent time.Time
+	mtu      int       // current interface MTU
 
 	// client
 	clientEph *ecdh.PrivateKey
@@ -46,6 +93,8 @@ type directEngine struct {
 	seenInit      map[[x25519Len]byte]time.Time
 	lastInitPub   [x25519Len]byte
 	lastResp      []byte
+
+	probeAcks chan uint32 // auto MTU: ids of acknowledged probes
 }
 
 const (
@@ -58,6 +107,9 @@ func RunDirect(cfg *DirectConfig) error {
 	if cfg.MTU == 0 {
 		cfg.MTU = 1400
 	}
+	if cfg.Paths < 1 {
+		cfg.Paths = 1
+	}
 	tun, err := openTUN(cfg.TunName)
 	if err != nil {
 		return err
@@ -68,57 +120,182 @@ func RunDirect(cfg *DirectConfig) error {
 	}
 	logf("info", "direct: interface %s up (%s peer %s, mtu %d)", tun.name, cfg.LocalIP, cfg.PeerIP, cfg.MTU)
 
-	e := &directEngine{cfg: cfg, tun: tun, seenInit: map[[x25519Len]byte]time.Time{}}
+	socks, peers, err := openDirectSockets(cfg)
+	if err != nil {
+		tun.Close()
+		return err
+	}
+	e, err := newDirectEngine(cfg, tun, socks, peers)
+	if err != nil {
+		for _, s := range socks {
+			s.Close()
+		}
+		tun.Close()
+		return err
+	}
+	if cfg.Role == "server" {
+		logf("info", "direct: waiting for peer on %s (carrier %s, %d path(s))", cfg.BindAddr, cfg.Carrier, cfg.Paths)
+	} else {
+		logf("info", "direct: dialing %s (carrier %s, %d path(s))", cfg.RemoteAddr, cfg.Carrier, cfg.Paths)
+	}
+	return e.run()
+}
+
+// openDirectSockets opens one UDP socket per path. The server listens on
+// bind port, bind port+1, …; the client uses ephemeral local ports and sends
+// path i to remote port + i.
+func openDirectSockets(cfg *DirectConfig) ([]*net.UDPConn, []*net.UDPAddr, error) {
+	n := cfg.Paths
+	var socks []*net.UDPConn
+	fail := func(err error) ([]*net.UDPConn, []*net.UDPAddr, error) {
+		for _, s := range socks {
+			s.Close()
+		}
+		return nil, nil, err
+	}
+	peers := make([]*net.UDPAddr, n)
 	if cfg.Role == "server" {
 		addr, err := net.ResolveUDPAddr("udp", cfg.BindAddr)
 		if err != nil {
-			return err
+			return fail(err)
 		}
-		if e.sock, err = net.ListenUDP("udp", addr); err != nil {
-			return err
+		for i := 0; i < n; i++ {
+			a := &net.UDPAddr{IP: addr.IP, Port: addr.Port + i, Zone: addr.Zone}
+			s, err := net.ListenUDP("udp", a)
+			if err != nil {
+				return fail(fmt.Errorf("path %d: %w", i, err))
+			}
+			socks = append(socks, s)
 		}
-		logf("info", "direct: waiting for peer on %s", cfg.BindAddr)
-	} else {
-		raddr, err := net.ResolveUDPAddr("udp", cfg.RemoteAddr)
-		if err != nil {
-			return err
-		}
-		if e.sock, err = net.ListenUDP("udp", &net.UDPAddr{Port: 0}); err != nil {
-			return err
-		}
-		e.peerAddr = raddr
+		return socks, peers, nil
 	}
-	e.sock.SetReadBuffer(4 << 20)
-	e.sock.SetWriteBuffer(4 << 20)
-
-	go e.maintain()
-	go e.tunToUDP()
-	e.udpToTun() // blocks
-	return nil
+	raddr, err := net.ResolveUDPAddr("udp", cfg.RemoteAddr)
+	if err != nil {
+		return fail(err)
+	}
+	for i := 0; i < n; i++ {
+		s, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+		if err != nil {
+			return fail(fmt.Errorf("path %d: %w", i, err))
+		}
+		socks = append(socks, s)
+		peers[i] = &net.UDPAddr{IP: raddr.IP, Port: raddr.Port + i, Zone: raddr.Zone}
+	}
+	return socks, peers, nil
 }
 
-// sendData seals p (empty p = keepalive) with the active keys and sends it.
-func (e *directEngine) sendData(p []byte) {
+// newDirectEngine wires the carrier (plain or forging sender) onto each socket.
+// peers holds the fixed send target of each path (client) or nils (server,
+// which learns them from authenticated packets).
+func newDirectEngine(cfg *DirectConfig, dev l3Device, socks []*net.UDPConn, peers []*net.UDPAddr) (*directEngine, error) {
+	if cfg.Carrier == "" {
+		cfg.Carrier = "udp"
+	}
+	e := &directEngine{
+		cfg:       cfg,
+		dev:       dev,
+		peers:     peers,
+		mtu:       cfg.MTU,
+		seenInit:  map[[x25519Len]byte]time.Time{},
+		probeAcks: make(chan uint32, 16),
+	}
+	if cfg.SpoofPeerIP != "" {
+		if e.spoofPeer = net.ParseIP(cfg.SpoofPeerIP).To4(); e.spoofPeer == nil {
+			return nil, fmt.Errorf("spoof_peer_ip %q is not an IPv4 address", cfg.SpoofPeerIP)
+		}
+	}
+	for i, s := range socks {
+		s.SetReadBuffer(4 << 20)
+		s.SetWriteBuffer(4 << 20)
+		p := &directPath{idx: i, sock: s, sender: plainSender{s}}
+		if cfg.Carrier == "spoof" {
+			snd, err := buildSender(s, cfg.SpoofSource, "")
+			if err != nil {
+				for _, q := range e.paths {
+					q.sender.Close()
+				}
+				return nil, err
+			}
+			p.sender = snd
+		}
+		e.paths = append(e.paths, p)
+	}
+	return e, nil
+}
+
+// run starts the engine and blocks until a socket or the device fails.
+func (e *directEngine) run() error {
+	errc := make(chan error, len(e.paths)+1)
+	go e.maintain()
+	if e.cfg.AutoMTU {
+		go e.autoMTULoop()
+	}
+	go func() { errc <- e.devToNet() }()
+	for _, p := range e.paths {
+		go func(p *directPath) { errc <- e.readLoop(p) }(p)
+	}
+	return <-errc
+}
+
+func (e *directEngine) close() {
+	for _, p := range e.paths {
+		p.sender.Close()
+		p.sock.Close()
+	}
+}
+
+// targetLocked returns the send target for path i, falling back to any path
+// whose peer address is known (the server learns path addresses one by one).
+// Caller holds e.mu.
+func (e *directEngine) targetLocked(i int) (*net.UDPAddr, int) {
+	if i < len(e.peers) && e.peers[i] != nil {
+		return e.peers[i], i
+	}
+	for j, a := range e.peers {
+		if a != nil {
+			return a, j
+		}
+	}
+	return nil, 0
+}
+
+// replyAddr is where packets for a peer seen at src go. When the client forges
+// its source IP, the server sends to its real IP (spoof_peer_ip) instead; the
+// port is kept, since the forging sender uses its socket's real port.
+func (e *directEngine) replyAddr(src *net.UDPAddr) *net.UDPAddr {
+	if e.spoofPeer != nil {
+		return &net.UDPAddr{IP: e.spoofPeer, Port: src.Port}
+	}
+	return src
+}
+
+func (e *directEngine) sendOn(p *directPath, pkt []byte, dst *net.UDPAddr) {
+	p.sender.sendTo(pkt, dst)
+	p.lastSent.Store(time.Now().UnixNano())
+}
+
+// sendData seals p (empty p = keepalive) with the active keys and sends it on
+// the given path.
+func (e *directEngine) sendData(p []byte, path int) {
 	e.mu.RLock()
-	k, peer, up := e.keys, e.peerAddr, e.up
+	k, up := e.keys, e.up
+	dst, pi := e.targetLocked(path)
 	e.mu.RUnlock()
-	if !up || k == nil || peer == nil {
+	if !up || k == nil || dst == nil {
 		return // tunnel not established yet: drop (IP will retransmit)
 	}
 	pkt := append([]byte{dirDATA}, k.send.seal(p)...)
-	e.sock.WriteToUDP(pkt, peer)
-	e.mu.Lock()
-	e.lastSent = time.Now()
-	e.mu.Unlock()
+	e.sendOn(e.paths[pi], pkt, dst)
 }
 
 // maintain runs once a second: the client (re)sends INIT until established and
-// re-handshakes when the peer goes silent; both sides send keepalives.
+// re-handshakes when the peer goes silent; both sides send keepalives on every
+// idle path (so each path's NAT mapping and learned address stay fresh).
 func (e *directEngine) maintain() {
 	for {
 		now := time.Now()
 		e.mu.Lock()
-		up, lastRecv, lastSent := e.up, e.lastRecv, e.lastSent
+		up, lastRecv := e.up, e.lastRecv
 		if e.cfg.Role != "server" && up && now.Sub(lastRecv) > directDeadAfter {
 			logf("warn", "direct: no packets from peer for %v, re-handshaking", directDeadAfter)
 			e.up, e.keys, e.replay, e.clientEph, e.initMsg = false, nil, nil, nil, nil
@@ -137,29 +314,77 @@ func (e *directEngine) maintain() {
 				}
 				e.clientEph, e.initMsg, e.initAt = eph, makeInit(e.cfg.Token, eph.PublicKey().Bytes(), now), now
 			}
-			initMsg, peer = e.initMsg, e.peerAddr
+			initMsg, peer = e.initMsg, e.peers[0]
 		}
 		e.mu.Unlock()
 
 		if initMsg != nil {
-			e.sock.WriteToUDP(initMsg, peer)
-		} else if up && now.Sub(lastSent) >= directKeepalive {
-			e.sendData(nil)
+			e.sendOn(e.paths[0], initMsg, peer)
+		} else if up {
+			for _, p := range e.paths {
+				if now.Sub(time.Unix(0, p.lastSent.Load())) >= directKeepalive {
+					e.sendData(nil, p.idx)
+				}
+			}
 		}
 		time.Sleep(time.Second)
 	}
 }
 
-func (e *directEngine) tunToUDP() {
+func (e *directEngine) devToNet() error {
 	buf := make([]byte, 65535)
+	n := len(e.paths)
 	for {
-		n, err := e.tun.Read(buf)
+		k, err := e.dev.Read(buf)
 		if err != nil {
 			logf("error", "direct: tun read: %v", err)
-			return
+			return err
 		}
-		e.sendData(buf[:n])
+		e.sendData(buf[:k], flowPath(buf[:k], n))
 	}
+}
+
+// flowPath picks the path for an inner IP packet: a hash of its addresses,
+// protocol and (TCP/UDP) ports, so one flow always takes one path and is never
+// reordered across paths.
+func flowPath(pkt []byte, n int) int {
+	if n <= 1 || len(pkt) < 20 {
+		return 0
+	}
+	var proto byte
+	var addrs, l4 []byte
+	switch pkt[0] >> 4 {
+	case 4:
+		ihl := int(pkt[0]&0x0f) * 4
+		if ihl < 20 || len(pkt) < ihl {
+			return 0
+		}
+		proto, addrs = pkt[9], pkt[12:20]
+		// fragments: only the first carries ports, so leave ports out for all of them
+		if binary.BigEndian.Uint16(pkt[6:8])&0x3fff == 0 {
+			l4 = pkt[ihl:]
+		}
+	case 6:
+		if len(pkt) < 40 {
+			return 0
+		}
+		proto, addrs, l4 = pkt[6], pkt[8:40], pkt[40:]
+	default:
+		return 0
+	}
+	h := uint32(2166136261) // FNV-1a
+	mix := func(b []byte) {
+		for _, c := range b {
+			h ^= uint32(c)
+			h *= 16777619
+		}
+	}
+	mix(addrs)
+	mix([]byte{proto})
+	if (proto == 6 || proto == 17) && len(l4) >= 4 {
+		mix(l4[:4])
+	}
+	return int(h % uint32(n))
 }
 
 // openData authenticates a DATA packet against keys k and replay window rw.
@@ -180,13 +405,13 @@ func openData(k *directKeys, rw *replayWindow, sealed []byte) ([]byte, bool) {
 	return plain, true
 }
 
-func (e *directEngine) udpToTun() {
+func (e *directEngine) readLoop(p *directPath) error {
 	buf := make([]byte, 65535)
 	for {
-		n, src, err := e.sock.ReadFromUDP(buf)
+		n, src, err := p.sock.ReadFromUDP(buf)
 		if err != nil {
-			logf("error", "direct: udp read: %v", err)
-			return
+			logf("error", "direct: udp read (path %d): %v", p.idx, err)
+			return err
 		}
 		if n < 1 {
 			continue
@@ -194,25 +419,38 @@ func (e *directEngine) udpToTun() {
 		switch buf[0] {
 		case dirINIT:
 			if e.cfg.Role == "server" {
-				e.handleInit(buf[:n], src)
+				e.handleInit(buf[:n], src, p)
 			}
 		case dirRESP:
 			if e.cfg.Role != "server" {
 				e.handleResp(buf[:n])
 			}
 		case dirDATA:
-			if n < 1+gcmNonce+gcmTag {
+			if n < directOverhead {
 				continue
 			}
-			plain, ok := e.handleData(buf[1:n], src)
-			if ok && len(plain) > 0 { // empty = keepalive
-				e.tun.Write(plain)
+			if plain, ok := e.handleData(buf[1:n], src, p.idx); ok {
+				e.deliver(plain, p.idx)
 			}
 		}
 	}
 }
 
-func (e *directEngine) handleData(sealed []byte, src *net.UDPAddr) ([]byte, bool) {
+// deliver hands an authenticated payload to the device, or to the control
+// handler. An IP packet starts with version 4 or 6, never 0x00, so a leading
+// zero byte marks an in-tunnel control message (older peers that do not know
+// them hand them to the kernel, which drops them as invalid IP).
+func (e *directEngine) deliver(plain []byte, path int) {
+	switch {
+	case len(plain) == 0: // keepalive
+	case plain[0] == ctlMarker:
+		e.handleControl(plain, path)
+	default:
+		e.dev.Write(plain)
+	}
+}
+
+func (e *directEngine) handleData(sealed []byte, src *net.UDPAddr, path int) ([]byte, bool) {
 	e.mu.RLock()
 	k, rw, pk, prw := e.keys, e.replay, e.pending, e.pendingReplay
 	e.mu.RUnlock()
@@ -240,9 +478,9 @@ func (e *directEngine) handleData(sealed []byte, src *net.UDPAddr) ([]byte, bool
 		}
 		e.up = true
 	}
-	if e.cfg.Role == "server" {
+	if e.cfg.Role == "server" && path < len(e.peers) {
 		// roaming: follow the peer's address, but only for authenticated, fresh packets
-		e.peerAddr = src
+		e.peers[path] = e.replyAddr(src)
 	}
 	e.lastRecv = time.Now()
 	e.mu.Unlock()
@@ -252,7 +490,7 @@ func (e *directEngine) handleData(sealed []byte, src *net.UDPAddr) ([]byte, bool
 // server side: got an INIT, answer RESP and stage the new keys (responder).
 // The active session is untouched until a DATA packet proves the initiator
 // holds the new keys, so a replayed or stray INIT cannot break the tunnel.
-func (e *directEngine) handleInit(msg []byte, src *net.UDPAddr) {
+func (e *directEngine) handleInit(msg []byte, src *net.UDPAddr, p *directPath) {
 	now := time.Now()
 	initPub, err := parseInit(e.cfg.Token, msg, now)
 	if err != nil {
@@ -261,13 +499,14 @@ func (e *directEngine) handleInit(msg []byte, src *net.UDPAddr) {
 	}
 	var pub [x25519Len]byte
 	copy(pub[:], initPub)
+	dst := e.replyAddr(src)
 
 	e.mu.Lock()
 	if pub == e.lastInitPub && e.lastResp != nil {
 		// retransmitted INIT (our RESP was lost): resend the same RESP, keep keys
 		resp := e.lastResp
 		e.mu.Unlock()
-		e.sock.WriteToUDP(resp, src)
+		e.sendOn(p, resp, dst)
 		return
 	}
 	if _, seen := e.seenInit[pub]; seen {
@@ -275,9 +514,9 @@ func (e *directEngine) handleInit(msg []byte, src *net.UDPAddr) {
 		logf("debug", "direct: dropped replayed INIT from %v", src)
 		return
 	}
-	for p, t := range e.seenInit {
+	for k, t := range e.seenInit {
 		if now.Sub(t) > 2*initMaxSkew {
-			delete(e.seenInit, p)
+			delete(e.seenInit, k)
 		}
 	}
 	e.seenInit[pub] = now
@@ -301,11 +540,12 @@ func (e *directEngine) handleInit(msg []byte, src *net.UDPAddr) {
 	e.pending, e.pendingReplay = keys, &replayWindow{}
 	e.lastInitPub, e.lastResp = pub, resp
 	e.mu.Unlock()
-	e.sock.WriteToUDP(resp, src)
+	e.sendOn(p, resp, dst)
 }
 
 // client side: got RESP, derive keys (initiator) and confirm with a keepalive
-// so the server switches to the new keys.
+// on every path, so the server switches to the new keys and learns each
+// path's address.
 func (e *directEngine) handleResp(msg []byte) {
 	e.mu.RLock()
 	eph, up := e.clientEph, e.up
@@ -334,6 +574,8 @@ func (e *directEngine) handleResp(msg []byte) {
 	e.keys, e.replay = keys, &replayWindow{}
 	e.up, e.lastRecv = true, time.Now()
 	e.mu.Unlock()
-	logf("info", "direct: tunnel established with %v", e.peerAddr)
-	e.sendData(nil) // lets the server promote the new keys right away
+	logf("info", "direct: tunnel established with %v", e.peers[0])
+	for _, p := range e.paths {
+		e.sendData(nil, p.idx)
+	}
 }

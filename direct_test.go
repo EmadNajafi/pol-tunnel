@@ -116,18 +116,18 @@ func newTestDirect(t *testing.T, role string) *directEngine {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { sock.Close() })
-	return &directEngine{
-		cfg:      &DirectConfig{Role: role, Token: "tok"},
-		sock:     sock,
-		seenInit: map[[x25519Len]byte]time.Time{},
+	e, err := newDirectEngine(&DirectConfig{Role: role, Token: "tok"}, nil, []*net.UDPConn{sock}, make([]*net.UDPAddr, 1))
+	if err != nil {
+		t.Fatal(err)
 	}
+	return e
 }
 
 // readResp reads the RESP the server sent to the client's socket.
 func readResp(t *testing.T, c *directEngine) []byte {
 	buf := make([]byte, 2048)
-	c.sock.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, _, err := c.sock.ReadFromUDP(buf)
+	c.paths[0].sock.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := c.paths[0].sock.ReadFromUDP(buf)
 	if err != nil {
 		t.Fatalf("no RESP: %v", err)
 	}
@@ -137,8 +137,8 @@ func readResp(t *testing.T, c *directEngine) []byte {
 // readData reads one DATA packet from e's socket and returns its sealed body.
 func readData(t *testing.T, e *directEngine) ([]byte, *net.UDPAddr) {
 	buf := make([]byte, 2048)
-	e.sock.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, src, err := e.sock.ReadFromUDP(buf)
+	e.paths[0].sock.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, src, err := e.paths[0].sock.ReadFromUDP(buf)
 	if err != nil {
 		t.Fatalf("no DATA: %v", err)
 	}
@@ -153,19 +153,19 @@ func TestDirectInitReplay(t *testing.T) {
 	srv := newTestDirect(t, "server")
 	cli := newTestDirect(t, "client")
 	atk := newTestDirect(t, "client")
-	cli.peerAddr = srv.sock.LocalAddr().(*net.UDPAddr)
-	cliAddr := cli.sock.LocalAddr().(*net.UDPAddr)
-	atkAddr := atk.sock.LocalAddr().(*net.UDPAddr)
+	cli.peers[0] = srv.paths[0].sock.LocalAddr().(*net.UDPAddr)
+	cliAddr := cli.paths[0].sock.LocalAddr().(*net.UDPAddr)
+	atkAddr := atk.paths[0].sock.LocalAddr().(*net.UDPAddr)
 
 	eph, _ := genEphemeral()
 	cli.clientEph = eph
 	initMsg := makeInit("tok", eph.PublicKey().Bytes(), time.Now())
 
-	srv.handleInit(initMsg, cliAddr)
+	srv.handleInit(initMsg, cliAddr, srv.paths[0])
 	resp := readResp(t, cli)
 	cli.handleResp(resp) // sends a keepalive under the new keys
 	sealed, src := readData(t, srv)
-	if _, ok := srv.handleData(sealed, src); !ok {
+	if _, ok := srv.handleData(sealed, src, 0); !ok {
 		t.Fatal("server rejected the client's first DATA")
 	}
 	if !srv.up || srv.keys == nil {
@@ -174,7 +174,7 @@ func TestDirectInitReplay(t *testing.T) {
 	active := srv.keys
 
 	// retransmission of the same INIT: same RESP again, keys unchanged
-	srv.handleInit(initMsg, cliAddr)
+	srv.handleInit(initMsg, cliAddr, srv.paths[0])
 	if again := readResp(t, cli); !bytes.Equal(again, resp) {
 		t.Error("retransmitted INIT got a different RESP")
 	}
@@ -184,25 +184,25 @@ func TestDirectInitReplay(t *testing.T) {
 
 	// a newer INIT from the same client, then the old one replayed by an attacker
 	eph2, _ := genEphemeral()
-	srv.handleInit(makeInit("tok", eph2.PublicKey().Bytes(), time.Now()), cliAddr)
+	srv.handleInit(makeInit("tok", eph2.PublicKey().Bytes(), time.Now()), cliAddr, srv.paths[0])
 	readResp(t, cli)
-	srv.handleInit(initMsg, atkAddr)
-	atk.sock.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-	if _, _, err := atk.sock.ReadFromUDP(make([]byte, 2048)); err == nil {
+	srv.handleInit(initMsg, atkAddr, srv.paths[0])
+	atk.paths[0].sock.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, _, err := atk.paths[0].sock.ReadFromUDP(make([]byte, 2048)); err == nil {
 		t.Error("replayed INIT was answered")
 	}
 	if srv.keys != active {
 		t.Error("INIT replay/new INIT changed the active keys before any DATA")
 	}
-	if srv.peerAddr.String() != cliAddr.String() {
-		t.Errorf("peer address hijacked: %v", srv.peerAddr)
+	if srv.peers[0].String() != cliAddr.String() {
+		t.Errorf("peer address hijacked: %v", srv.peers[0])
 	}
 
 	// replaying an old DATA packet from the attacker's address is rejected too
-	if _, ok := srv.handleData(sealed, atkAddr); ok {
+	if _, ok := srv.handleData(sealed, atkAddr, 0); ok {
 		t.Error("replayed DATA accepted")
 	}
-	if srv.peerAddr.String() != cliAddr.String() {
-		t.Errorf("peer address hijacked by DATA replay: %v", srv.peerAddr)
+	if srv.peers[0].String() != cliAddr.String() {
+		t.Errorf("peer address hijacked by DATA replay: %v", srv.peers[0])
 	}
 }
