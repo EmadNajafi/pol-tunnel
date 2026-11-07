@@ -129,7 +129,10 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now "pol-$name.service" >/dev/null 2>&1
+  if ! systemctl enable --now "pol-$name.service" >/dev/null 2>&1; then
+    err "service pol-$name failed to start — see: journalctl -u pol-$name -n 30"
+    return 1
+  fi
 }
 
 valid_name() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
@@ -250,7 +253,7 @@ do_create() {
   esac
 
   chmod 600 "$f"
-  write_service "$name"
+  write_service "$name" || return 1
   ok "tunnel '$name' created and started"
   sleep 1
   systemctl --no-pager -l status "pol-$name.service" | sed -n '1,6p' || true
@@ -265,10 +268,13 @@ do_list() {
     any=1
     st="$(systemctl is-active "pol-$n.service" 2>/dev/null || true)"
     [ "$st" = active ] && st="${C_GRN}active${C_RESET}" || st="${C_RED}$st${C_RESET}"
-    local tr; tr="$(grep -E '^transport|^role' "$CFGDIR/$n.toml" 2>/dev/null | head -1 | sed 's/.*= *//; s/"//g')"
+    local tr; tr="$(grep -E '^transport|^role' "$CFGDIR/$n.toml" 2>/dev/null | head -1 | sed 's/.*= *//; s/"//g' || true)"
     printf '  %-16s %-10s %s\n' "$n" "$tr" "$st"
   done
-  [ $any -eq 0 ] && warn "no tunnels yet (create one from the menu)"
+  # (an `[ ... ] && warn` as the last line would return 1 when there ARE
+  # tunnels, and under `set -e` that silently killed the whole menu)
+  if [ $any -eq 0 ]; then warn "no tunnels yet (create one from the menu)"; fi
+  return 0
 }
 
 # prints the chosen tunnel name on stdout (menu + prompt go to stderr)
@@ -279,6 +285,7 @@ pick_tunnel() {
   { for nm in "${names[@]}"; do say "  $i) $nm"; i=$((i+1)); done
     read -rp "pick [1]: " c; } >&2
   c=${c:-1}
+  [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] || { err "invalid choice"; return 1; }
   local sel="${names[$((c-1))]:-}"
   [ -n "$sel" ] || return 1
   printf '%s' "$sel"
@@ -350,12 +357,20 @@ do_uninstall() {
   ok "pol removed"
 }
 
+# Run one menu action; on failure say so and wait, then go back to the menu.
+run_action() {
+  local rc=0
+  "$@" || rc=$?
+  [ $rc -eq 0 ] || err "that step failed (exit $rc) — nothing else was changed"
+  pause || true
+}
+
 menu() {
   while true; do
     clear 2>/dev/null || true
     printf '%s%s pol tunnel manager %s %s\n' "$C_B" "$C_CYN" "$C_RESET" "$([ -x "$BIN" ] && "$BIN" -version 2>/dev/null || echo '(not installed)')"
     hr
-    do_list
+    do_list || true
     hr
     say "  1) Install / update pol"
     say "  2) Create a tunnel"
@@ -368,15 +383,17 @@ menu() {
     say "  0) Exit"
     [ -x "$MGR" ] && say "${C_DIM}  (reopen this menu any time with:  poltunnel)${C_RESET}"
     local c; read -rp $'\nchoice: ' c || { echo; exit 0; } # exit cleanly on EOF (non-interactive)
+    # A failing action must report and return to the menu, not exit the script
+    # (under `set -e` any non-zero return here used to close the menu silently).
     case "$c" in
-      1) do_install; pause;;
-      2) do_create; pause;;
-      3) do_startstop; pause;;
-      4) do_logs; pause;;
-      5) do_delete; pause;;
-      6) do_conntest; pause;;
-      7) do_linktest; pause;;
-      8) do_uninstall; pause;;
+      1) run_action do_install;;
+      2) run_action do_create;;
+      3) run_action do_startstop;;
+      4) run_action do_logs;;
+      5) run_action do_delete;;
+      6) run_action do_conntest;;
+      7) run_action do_linktest;;
+      8) run_action do_uninstall;;
       0|q) exit 0;;
       *) ;;
     esac
