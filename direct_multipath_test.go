@@ -105,22 +105,25 @@ func TestFlowPath(t *testing.T) {
 	}
 }
 
-// dropBig is a sender that drops datagrams larger than limit (a route with a
-// small MTU) and counts packets per path.
+// dropBig wraps a path's transport, dropping datagrams larger than limit (a
+// route with a small MTU) and counting packets per path.
 type dropBig struct {
-	inner packetSender
+	inner pathIO
 	limit int
 	sent  atomic.Int64
 }
 
-func (d *dropBig) sendTo(b []byte, dst *net.UDPAddr) error {
+func (d *dropBig) send(b []byte, dst *net.UDPAddr) error {
 	d.sent.Add(1)
 	if d.limit > 0 && len(b) > d.limit {
 		return nil
 	}
-	return d.inner.sendTo(b, dst)
+	return d.inner.send(b, dst)
 }
-func (d *dropBig) Close() error { return d.inner.Close() }
+func (d *dropBig) recv(b []byte) (int, *net.UDPAddr, error) { return d.inner.recv(b) }
+func (d *dropBig) setDF(on bool)                            { d.inner.setDF(on) }
+func (d *dropBig) localPort() int                           { return d.inner.localPort() }
+func (d *dropBig) Close() error                             { return d.inner.Close() }
 
 // startPair runs a server and a client engine over n loopback paths.
 func startPair(t *testing.T, n int, autoMTU bool) (srv, cli *directEngine, sdev, cdev *fakeDev) {
@@ -141,17 +144,17 @@ func startPair(t *testing.T, n int, autoMTU bool) (srv, cli *directEngine, sdev,
 	}
 	sdev, cdev = newFakeDev(), newFakeDev()
 	var err error
-	srv, err = newDirectEngine(&DirectConfig{Role: "server", Token: "tok", Paths: n, MTU: 1400, AutoMTU: autoMTU}, sdev, ssocks, make([]*net.UDPAddr, n))
+	srv, err = newDirectEngineUDP(&DirectConfig{Role: "server", Token: "tok", Paths: n, MTU: 1400, AutoMTU: autoMTU}, sdev, ssocks, make([]*net.UDPAddr, n))
 	if err != nil {
 		t.Fatal(err)
 	}
-	cli, err = newDirectEngine(&DirectConfig{Role: "client", Token: "tok", Paths: n, MTU: 1400, AutoMTU: autoMTU}, cdev, csocks, cpeers)
+	cli, err = newDirectEngineUDP(&DirectConfig{Role: "client", Token: "tok", Paths: n, MTU: 1400, AutoMTU: autoMTU}, cdev, csocks, cpeers)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range []*directEngine{srv, cli} {
 		for _, p := range e.paths {
-			p.sender = &dropBig{inner: p.sender}
+			p.io = &dropBig{inner: p.io}
 		}
 	}
 	t.Cleanup(func() {
@@ -219,7 +222,7 @@ func TestDirectMultipathEndToEnd(t *testing.T) {
 	// traffic really used every path in both directions
 	for _, e := range []*directEngine{srv, cli} {
 		for _, p := range e.paths {
-			if c := p.sender.(*dropBig).sent.Load(); c < 2 {
+			if c := p.io.(*dropBig).sent.Load(); c < 2 {
 				t.Errorf("%s path %d sent only %d packets", e.cfg.Role, p.idx, c)
 			}
 		}
@@ -233,7 +236,7 @@ func TestDirectAutoMTU(t *testing.T) {
 
 	srv, cli, sdev, cdev := startPair(t, 1, true)
 	// the client's route drops datagrams over 1300 bytes
-	cli.paths[0].sender.(*dropBig).limit = 1300
+	cli.paths[0].io.(*dropBig).limit = 1300
 	go srv.run()
 	go cli.run()
 
@@ -276,7 +279,7 @@ func TestDirectSpoofPeerReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sock.Close()
-	e, err := newDirectEngine(&DirectConfig{Role: "server", Token: "tok", SpoofPeerIP: "198.51.100.7"}, nil, []*net.UDPConn{sock}, make([]*net.UDPAddr, 1))
+	e, err := newDirectEngineUDP(&DirectConfig{Role: "server", Token: "tok", SpoofPeerIP: "198.51.100.7"}, nil, []*net.UDPConn{sock}, make([]*net.UDPAddr, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,16 +313,30 @@ func TestDirectConfigCarriers(t *testing.T) {
 	if d := c.Direct; d.Carrier != "spoof" || d.Paths != 4 || d.AutoMTU || d.SpoofSource != "10.10.10.10" || d.SpoofPeerIP != "1.2.3.4" {
 		t.Errorf("parsed %+v", d)
 	}
+	// pck and icmp need no extra field; sni needs sni_domain
+	for _, car := range []string{"pck", "icmp"} {
+		if c, err := load("carrier = \"" + car + "\"\n"); err != nil || c.Direct.Carrier != car {
+			t.Errorf("carrier %q: err=%v", car, err)
+		}
+	}
+	c, err = load("carrier = \"sni\"\nsni_domain = \"www.example.com\"\n")
+	if err != nil || c.Direct.SNIDomain != "www.example.com" {
+		t.Errorf("sni parse: err=%v domain=%q", err, c.Direct.SNIDomain)
+	}
 	bad := map[string]string{
-		"carrier = \"spoof\"\n":                      "spoof_source",
-		"spoof_source = \"10.10.10.10\"\n":           "carrier",
-		"carrier = \"tcp\"\n":                        "refused",
-		"carrier = \"pigeon\"\n":                     "carrier",
-		"paths = 0\n":                                "paths",
-		"paths = 17\n":                               "paths",
-		"spoof_peer_ip = \"x\"\n":                    "spoof_peer_ip",
-		"bind_addr = \"0.0.0.0:65535\"\npaths = 2\n": "65535",
-		"mtu = 100\n":                                "mtu",
+		"carrier = \"spoof\"\n":                            "spoof_source",
+		"spoof_source = \"10.10.10.10\"\n":                 "spoof_source",
+		"carrier = \"tcp\"\n":                              "refused",
+		"carrier = \"quic\"\n":                             "refused",
+		"carrier = \"pigeon\"\n":                           "carrier",
+		"carrier = \"sni\"\n":                              "sni_domain",
+		"carrier = \"pck\"\nsni_domain = \"x.com\"\n":      "sni_domain",
+		"carrier = \"icmp\"\nspoof_source = \"1.1.1.1\"\n": "spoof_source",
+		"paths = 0\n":                                      "paths",
+		"paths = 17\n":                                     "paths",
+		"spoof_peer_ip = \"x\"\n":                          "spoof_peer_ip",
+		"bind_addr = \"0.0.0.0:65535\"\npaths = 2\n":       "65535",
+		"mtu = 100\n":                                      "mtu",
 	}
 	for extra, want := range bad {
 		if _, err := load(extra); err == nil || !strings.Contains(err.Error(), want) {

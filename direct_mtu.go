@@ -95,8 +95,8 @@ func (e *directEngine) probe(size int) bool {
 // measureMTU returns the largest UDP payload size that reaches the peer, or 0
 // if not even the smallest one does.
 func (e *directEngine) measureMTU() int {
-	e.setPMTUProbe(true)
-	defer e.setPMTUProbe(false)
+	e.setDFAll(true)
+	defer e.setDFAll(false)
 	lo, hi := mtuProbeMin, mtuProbeMax
 	if !e.probe(lo) {
 		return 0
@@ -112,15 +112,10 @@ func (e *directEngine) measureMTU() int {
 	return lo
 }
 
-// setPMTUProbe turns Don't-Fragment probing on or off on every path.
-func (e *directEngine) setPMTUProbe(on bool) {
+// setDFAll turns Don't-Fragment on or off on every path (auto-MTU probing).
+func (e *directEngine) setDFAll(on bool) {
 	for _, p := range e.paths {
-		if err := setPMTUProbe(p.sock, on); err != nil {
-			logf("debug", "direct: path %d: pmtu probe mode: %v", p.idx, err)
-		}
-		if d, ok := p.sender.(interface{ setDF(bool) }); ok {
-			d.setDF(on)
-		}
+		p.io.setDF(on)
 	}
 }
 

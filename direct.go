@@ -5,8 +5,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -20,6 +23,9 @@ import (
 //	udp    plain UDP datagrams (default)
 //	spoof  UDP with a forged source IPv4 (raw socket: Linux + root, and a
 //	       datacenter without BCP38 egress filtering)
+//	pck    hand-built TCP segments, no socket and no connection (Linux + root)
+//	sni    pck preceded by a decoy TLS ClientHello naming an allowed domain
+//	icmp   ICMP echo-reply messages (Linux + root)
 //
 // paths = N spreads the tunnel over N UDP sockets on consecutive ports, one
 // inner flow per socket, so a per-flow rate limit on the route applies to
@@ -37,9 +43,10 @@ type DirectConfig struct {
 	PeerIP     string // the other side's tunnel IP
 	MTU        int    // interface MTU (the starting value when AutoMTU is on)
 
-	Carrier     string // "udp" (default) or "spoof"
+	Carrier     string // udp (default), spoof, pck, sni or icmp
 	SpoofSource string // spoof: forge this source IPv4 on outgoing packets
 	SpoofPeerIP string // server: the client's real IPv4, needed when the client forges its source
+	SNIDomain   string // sni: the domain named in the decoy TLS ClientHello
 	Paths       int    // number of sockets on consecutive ports (multipath); 1 = single socket
 	AutoMTU     bool   // measure the route and set the interface MTU (needs a peer that answers probes)
 }
@@ -59,12 +66,11 @@ type l3Device interface {
 	setMTU(int) error
 }
 
-// directPath is one carrier socket. With paths = N there are N of them on
-// consecutive ports.
+// directPath is one carrier transport. With paths = N there are N of them on
+// consecutive ports (or, for icmp, consecutive identifiers).
 type directPath struct {
 	idx      int
-	sock     *net.UDPConn
-	sender   packetSender // plain UDP, or the forging raw sender
+	io       pathIO
 	lastSent atomic.Int64 // unix nanos of the last packet sent on this path
 }
 
@@ -95,6 +101,8 @@ type directEngine struct {
 	lastResp      []byte
 
 	probeAcks chan uint32 // auto MTU: ids of acknowledged probes
+	cleanup   func()      // carrier teardown (e.g. remove the RST firewall rule)
+	closeOnce sync.Once
 }
 
 const (
@@ -120,19 +128,31 @@ func RunDirect(cfg *DirectConfig) error {
 	}
 	logf("info", "direct: interface %s up (%s peer %s, mtu %d)", tun.name, cfg.LocalIP, cfg.PeerIP, cfg.MTU)
 
-	socks, peers, err := openDirectSockets(cfg)
+	paths, peers, cleanup, err := openDirectPaths(cfg)
 	if err != nil {
 		tun.Close()
 		return err
 	}
-	e, err := newDirectEngine(cfg, tun, socks, peers)
+	e, err := newDirectEngine(cfg, tun, paths, peers)
 	if err != nil {
-		for _, s := range socks {
-			s.Close()
+		for _, p := range paths {
+			p.io.Close()
 		}
+		cleanup()
 		tun.Close()
 		return err
 	}
+	e.cleanup = cleanup
+	defer e.close()
+	// A systemctl stop (SIGTERM) must still run cleanup, e.g. remove the RST
+	// firewall rule the pck/sni carriers add; otherwise it would leak.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sig
+		e.close()
+		os.Exit(0)
+	}()
 	if cfg.Role == "server" {
 		logf("info", "direct: waiting for peer on %s (carrier %s, %d path(s))", cfg.BindAddr, cfg.Carrier, cfg.Paths)
 	} else {
@@ -184,16 +204,17 @@ func openDirectSockets(cfg *DirectConfig) ([]*net.UDPConn, []*net.UDPAddr, error
 	return socks, peers, nil
 }
 
-// newDirectEngine wires the carrier (plain or forging sender) onto each socket.
-// peers holds the fixed send target of each path (client) or nils (server,
-// which learns them from authenticated packets).
-func newDirectEngine(cfg *DirectConfig, dev l3Device, socks []*net.UDPConn, peers []*net.UDPAddr) (*directEngine, error) {
+// newDirectEngine builds the engine over ready per-path transports. peers holds
+// the fixed send target of each path (client) or nils (server, which learns
+// them from authenticated packets).
+func newDirectEngine(cfg *DirectConfig, dev l3Device, paths []*directPath, peers []*net.UDPAddr) (*directEngine, error) {
 	if cfg.Carrier == "" {
 		cfg.Carrier = "udp"
 	}
 	e := &directEngine{
 		cfg:       cfg,
 		dev:       dev,
+		paths:     paths,
 		peers:     peers,
 		mtu:       cfg.MTU,
 		seenInit:  map[[x25519Len]byte]time.Time{},
@@ -204,23 +225,17 @@ func newDirectEngine(cfg *DirectConfig, dev l3Device, socks []*net.UDPConn, peer
 			return nil, fmt.Errorf("spoof_peer_ip %q is not an IPv4 address", cfg.SpoofPeerIP)
 		}
 	}
-	for i, s := range socks {
-		s.SetReadBuffer(4 << 20)
-		s.SetWriteBuffer(4 << 20)
-		p := &directPath{idx: i, sock: s, sender: plainSender{s}}
-		if cfg.Carrier == "spoof" {
-			snd, err := buildSender(s, cfg.SpoofSource, "")
-			if err != nil {
-				for _, q := range e.paths {
-					q.sender.Close()
-				}
-				return nil, err
-			}
-			p.sender = snd
-		}
-		e.paths = append(e.paths, p)
-	}
 	return e, nil
+}
+
+// newDirectEngineUDP builds a udp/spoof engine straight from UDP sockets (used
+// by tests and by the udp/spoof path of RunDirect through openDirectPaths).
+func newDirectEngineUDP(cfg *DirectConfig, dev l3Device, socks []*net.UDPConn, peers []*net.UDPAddr) (*directEngine, error) {
+	paths, err := udpPaths(cfg, socks)
+	if err != nil {
+		return nil, err
+	}
+	return newDirectEngine(cfg, dev, paths, peers)
 }
 
 // run starts the engine and blocks until a socket or the device fails.
@@ -238,10 +253,14 @@ func (e *directEngine) run() error {
 }
 
 func (e *directEngine) close() {
-	for _, p := range e.paths {
-		p.sender.Close()
-		p.sock.Close()
-	}
+	e.closeOnce.Do(func() {
+		for _, p := range e.paths {
+			p.io.Close()
+		}
+		if e.cleanup != nil {
+			e.cleanup()
+		}
+	})
 }
 
 // targetLocked returns the send target for path i, falling back to any path
@@ -270,7 +289,9 @@ func (e *directEngine) replyAddr(src *net.UDPAddr) *net.UDPAddr {
 }
 
 func (e *directEngine) sendOn(p *directPath, pkt []byte, dst *net.UDPAddr) {
-	p.sender.sendTo(pkt, dst)
+	if err := p.io.send(pkt, dst); err != nil {
+		logf("debug", "direct: path %d send: %v", p.idx, err)
+	}
 	p.lastSent.Store(time.Now().UnixNano())
 }
 
@@ -408,9 +429,9 @@ func openData(k *directKeys, rw *replayWindow, sealed []byte) ([]byte, bool) {
 func (e *directEngine) readLoop(p *directPath) error {
 	buf := make([]byte, 65535)
 	for {
-		n, src, err := p.sock.ReadFromUDP(buf)
+		n, src, err := p.io.recv(buf)
 		if err != nil {
-			logf("error", "direct: udp read (path %d): %v", p.idx, err)
+			logf("error", "direct: read (path %d): %v", p.idx, err)
 			return err
 		}
 		if n < 1 {

@@ -116,7 +116,7 @@ func newTestDirect(t *testing.T, role string) *directEngine {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { sock.Close() })
-	e, err := newDirectEngine(&DirectConfig{Role: role, Token: "tok"}, nil, []*net.UDPConn{sock}, make([]*net.UDPAddr, 1))
+	e, err := newDirectEngineUDP(&DirectConfig{Role: role, Token: "tok"}, nil, []*net.UDPConn{sock}, make([]*net.UDPAddr, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,8 +126,8 @@ func newTestDirect(t *testing.T, role string) *directEngine {
 // readResp reads the RESP the server sent to the client's socket.
 func readResp(t *testing.T, c *directEngine) []byte {
 	buf := make([]byte, 2048)
-	c.paths[0].sock.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, _, err := c.paths[0].sock.ReadFromUDP(buf)
+	c.paths[0].conn().SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := c.paths[0].conn().ReadFromUDP(buf)
 	if err != nil {
 		t.Fatalf("no RESP: %v", err)
 	}
@@ -137,8 +137,8 @@ func readResp(t *testing.T, c *directEngine) []byte {
 // readData reads one DATA packet from e's socket and returns its sealed body.
 func readData(t *testing.T, e *directEngine) ([]byte, *net.UDPAddr) {
 	buf := make([]byte, 2048)
-	e.paths[0].sock.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, src, err := e.paths[0].sock.ReadFromUDP(buf)
+	e.paths[0].conn().SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, src, err := e.paths[0].conn().ReadFromUDP(buf)
 	if err != nil {
 		t.Fatalf("no DATA: %v", err)
 	}
@@ -153,9 +153,9 @@ func TestDirectInitReplay(t *testing.T) {
 	srv := newTestDirect(t, "server")
 	cli := newTestDirect(t, "client")
 	atk := newTestDirect(t, "client")
-	cli.peers[0] = srv.paths[0].sock.LocalAddr().(*net.UDPAddr)
-	cliAddr := cli.paths[0].sock.LocalAddr().(*net.UDPAddr)
-	atkAddr := atk.paths[0].sock.LocalAddr().(*net.UDPAddr)
+	cli.peers[0] = srv.paths[0].conn().LocalAddr().(*net.UDPAddr)
+	cliAddr := cli.paths[0].conn().LocalAddr().(*net.UDPAddr)
+	atkAddr := atk.paths[0].conn().LocalAddr().(*net.UDPAddr)
 
 	eph, _ := genEphemeral()
 	cli.clientEph = eph
@@ -187,8 +187,8 @@ func TestDirectInitReplay(t *testing.T) {
 	srv.handleInit(makeInit("tok", eph2.PublicKey().Bytes(), time.Now()), cliAddr, srv.paths[0])
 	readResp(t, cli)
 	srv.handleInit(initMsg, atkAddr, srv.paths[0])
-	atk.paths[0].sock.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-	if _, _, err := atk.paths[0].sock.ReadFromUDP(make([]byte, 2048)); err == nil {
+	atk.paths[0].conn().SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, _, err := atk.paths[0].conn().ReadFromUDP(make([]byte, 2048)); err == nil {
 		t.Error("replayed INIT was answered")
 	}
 	if srv.keys != active {

@@ -10,9 +10,10 @@ local_ip = "10.200.0.1"        # this side's tunnel IP
 peer_ip  = "10.200.0.2"        # the other side's tunnel IP
 mtu = 1400                     # starting MTU; auto_mtu replaces it with the measured one
 
-carrier = "udp"                # this side's outgoing packets: "udp" or "spoof" (forged source IP)
+carrier = "udp"                # this side's outgoing packets: udp | spoof | pck | sni | icmp (all but udp: Linux + root)
 # spoof_source = "10.10.10.10" # carrier = "spoof": the source IP to forge (root, no BCP38 at the datacenter)
 # spoof_peer_ip = "CLIENT_IP"  # only if the CLIENT uses carrier = "spoof": its real IP (replies go here)
+# sni_domain = "www.cloudflare.com" # carrier = "sni": the domain named in the decoy TLS ClientHello
 paths = 1                      # UDP sockets on consecutive ports, one flow each; SAME on both sides
 auto_mtu = true                # measure the route and set the interface MTU to match
 
