@@ -245,7 +245,9 @@ func newSpoofDialer(cfg *ClientConfig) Dialer {
 		initErr error
 	)
 	start := func() {
-		remote, initErr = net.ResolveUDPAddr("udp", cfg.RemoteAddr)
+		// spoof is point-to-point: one server (the first of remote_addr / remote_addrs)
+		remoteAddr := cfg.allRemotes()[0]
+		remote, initErr = net.ResolveUDPAddr("udp", remoteAddr)
 		if initErr != nil {
 			return
 		}
@@ -256,7 +258,7 @@ func newSpoofDialer(cfg *ClientConfig) Dialer {
 		}
 		sock.SetReadBuffer(8 << 20)
 		sock.SetWriteBuffer(8 << 20)
-		sender, err := buildSender(sock, cfg.SpoofSource, cfg.RemoteAddr)
+		sender, err := buildSender(sock, cfg.SpoofSource, remoteAddr)
 		if err != nil {
 			sock.Close()
 			initErr = err

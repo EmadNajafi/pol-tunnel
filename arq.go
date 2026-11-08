@@ -84,6 +84,7 @@ type arqConn struct {
 	// recv side
 	rcvNext     uint32
 	lastAckSent uint32
+	lastWndSent uint16
 	rcvBuf      map[uint32]*seg
 	rStream     []byte
 	rEOF        bool
@@ -99,11 +100,12 @@ type arqConn struct {
 func newARQ(send func([]byte) error, local, remote net.Addr) *arqConn {
 	c := &arqConn{
 		send: send, local: local, remote: remote,
-		wk:       make(chan struct{}, 1),
-		rmtWnd:   arqRecvWnd,
-		cwnd:     32,
-		ssthresh: 1 << 20,
-		rcvBuf:   map[uint32]*seg{},
+		wk:          make(chan struct{}, 1),
+		rmtWnd:      arqRecvWnd,
+		lastWndSent: arqRecvWnd,
+		cwnd:        32,
+		ssthresh:    1 << 20,
+		rcvBuf:      map[uint32]*seg{},
 	}
 	c.rc = sync.NewCond(&c.mu)
 	go c.updater()
@@ -415,9 +417,28 @@ func (c *arqConn) updater() {
 	}
 }
 
+// recvWindow is the free receive window advertised to the peer, in segments.
+// Delivered-but-unread bytes (rStream) count against it too: without that a
+// fast sender and a slow reader (e.g. a download to a slow visitor) would grow
+// rStream without bound, since the window would never shrink.
+func (c *arqConn) recvWindow() uint16 {
+	free := arqRecvWnd - len(c.rcvBuf) - (len(c.rStream)+arqMTU-1)/arqMTU
+	if free < 0 {
+		free = 0
+	}
+	return uint16(free)
+}
+
 func (c *arqConn) flush(idle int) {
 	now := time.Now()
-	wnd := uint16(arqRecvWnd - len(c.rcvBuf))
+	wnd := c.recvWindow()
+
+	// The window reopened after the application drained a backlog: tell the
+	// sender now instead of waiting for its next zero-window probe.
+	if c.lastWndSent < arqRecvWnd/4 && wnd >= arqRecvWnd/2 && len(c.acks) == 0 && c.rcvNext == c.lastAckSent {
+		c.emit(arqAck, 0, c.rcvNext, wnd, nil)
+	}
+	c.lastWndSent = wnd
 
 	for _, seq := range c.acks {
 		c.emit(arqAck, 0, seq, wnd, nil)
