@@ -74,10 +74,26 @@ func echoUDP(t *testing.T) string {
 	return uc.LocalAddr().String()
 }
 
+// freePort returns a port free for both TCP and UDP: the callers bind it as
+// either (the spoof transports and the public UDP mapping use UDP), and a
+// TCP-only check let it collide with the ephemeral UDP sockets of earlier
+// spoof tests ("bind: address already in use", flaky under -race in CI).
 func freePort(t *testing.T) int {
-	ln, _ := net.Listen("tcp", "127.0.0.1:0")
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
+	for i := 0; i < 50; i++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := ln.Addr().(*net.TCPAddr).Port
+		uc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: p})
+		ln.Close()
+		if err == nil {
+			uc.Close()
+			return p
+		}
+	}
+	t.Fatal("no port free for both tcp and udp")
+	return 0
 }
 
 func TestEndToEnd(t *testing.T) {
