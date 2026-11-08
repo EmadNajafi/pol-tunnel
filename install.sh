@@ -2,6 +2,10 @@
 # pol — interactive installer & tunnel manager (Backhaul/BackPack-style menu).
 #
 #   curl -fsSL https://raw.githubusercontent.com/EmadNajafi/pol-tunnel/main/install.sh | sudo bash
+#   curl -fsSL https://github.com/EmadNajafi/pol-tunnel/releases/latest/download/install.sh | sudo bash   # where raw.githubusercontent.com is blocked (Iran)
+#
+# Run that way it installs or updates pol and the `poltunnel` menu first, then
+# opens the menu. `... | sudo bash -s -- update` updates without the menu.
 #
 # (Not `sudo bash <(curl ...)`: sudo closes the /dev/fd pipe, so bash reports
 # "/dev/fd/63: No such file or directory".)
@@ -16,6 +20,21 @@ MGR="/usr/local/bin/poltunnel"
 CFGDIR="/etc/pol"
 VERSION_TAG="latest"
 RAW_URL="https://raw.githubusercontent.com/$REPO/main/install.sh"
+# The same script, attached to every release. It comes from github.com, which
+# is reachable from networks that block raw.githubusercontent.com (Iran).
+REL_URL="https://github.com/$REPO/releases/latest/download/install.sh"
+
+# Downloads with timeouts, so a slow or blocked network fails with a message
+# instead of hanging the installer (which looks like a freeze). The connect
+# timeout covers the TLS handshake too, where a filtered host usually stalls.
+curl_dl() { curl -fsSL --connect-timeout 15 --max-time 180 "$@"; }
+
+# latest_tag prints the newest release tag (e.g. v0.3.2), read from the
+# redirect of /releases/latest; empty when it cannot be told.
+latest_tag() {
+  curl -fsSI --connect-timeout 10 --max-time 20 -o /dev/null -w '%{redirect_url}' \
+    "https://github.com/$REPO/releases/latest" 2>/dev/null | sed -n 's#.*/tag/##p'
+}
 
 C_RESET=$'\e[0m'; C_B=$'\e[1m'; C_GRN=$'\e[32m'; C_YEL=$'\e[33m'; C_RED=$'\e[31m'; C_CYN=$'\e[36m'; C_DIM=$'\e[2m'
 
@@ -43,51 +62,84 @@ gen_token() {
 
 # ---------- install / update ----------
 do_install() {
-  local arch base url tmp sums want got
+  local arch base url tmp sums want got tag cur skip=""
   arch="$(detect_arch)"
   if [ "$VERSION_TAG" = latest ]; then
     base="https://github.com/$REPO/releases/latest/download"
   else
     base="https://github.com/$REPO/releases/download/$VERSION_TAG"
   fi
-  url="$base/pol-linux-$arch"
-  say "downloading pol ($arch) ..."
-  # temp file next to the target: same filesystem, and not on a noexec /tmp
-  tmp="$(mktemp "$BIN.XXXXXX")"; sums="$(mktemp)"
-  if ! curl -fsSL "$url" -o "$tmp"; then
-    err "download failed from $url"
-    rm -f "$tmp" "$sums"; return 1
+  sums="$(mktemp)"
+  # the release's SHA256SUMS (catches truncated/corrupted downloads)
+  curl_dl "$base/SHA256SUMS" -o "$sums" 2>/dev/null || : > "$sums"
+
+  # already the newest release? then only the menu is refreshed
+  if [ "$VERSION_TAG" = latest ] && [ -x "$BIN" ]; then
+    tag="$(latest_tag)"
+    cur="$("$BIN" -version 2>/dev/null | awk '{print $2}')"
+    if [ -n "$tag" ] && [ "v$cur" = "$tag" ]; then
+      ok "pol is up to date ($tag)"
+      skip=1
+    fi
   fi
-  # verify against the release's SHA256SUMS (catches truncated/corrupted downloads)
-  if curl -fsSL "$base/SHA256SUMS" -o "$sums" 2>/dev/null && [ -s "$sums" ]; then
-    want="$(awk -v f="pol-linux-$arch" '$2==f || $2=="*"f {print $1}' "$sums")"
-    got="$(sha256sum "$tmp" | awk '{print $1}')"
-    if [ -z "$want" ] || [ "$want" != "$got" ]; then
-      err "checksum mismatch for pol-linux-$arch (expected ${want:-none}, got $got) — not installing"
+
+  if [ -z "$skip" ]; then
+    url="$base/pol-linux-$arch"
+    say "downloading pol ($arch) ..."
+    # temp file next to the target: same filesystem, and not on a noexec /tmp
+    tmp="$(mktemp "$BIN.XXXXXX")"
+    if ! curl_dl "$url" -o "$tmp"; then
+      err "download failed from $url (timed out or unreachable)"
       rm -f "$tmp" "$sums"; return 1
     fi
-    ok "checksum verified"
-  else
-    warn "this release has no SHA256SUMS; skipping checksum verification"
+    if [ -s "$sums" ]; then
+      want="$(awk -v f="pol-linux-$arch" '$2==f || $2=="*"f {print $1}' "$sums")"
+      got="$(sha256sum "$tmp" | awk '{print $1}')"
+      if [ -z "$want" ] || [ "$want" != "$got" ]; then
+        err "checksum mismatch for pol-linux-$arch (expected ${want:-none}, got $got) — not installing"
+        rm -f "$tmp" "$sums"; return 1
+      fi
+      ok "checksum verified"
+    else
+      warn "this release has no SHA256SUMS; skipping checksum verification"
+    fi
+    chmod 0755 "$tmp"
+    if ! "$tmp" -version >/dev/null 2>&1; then
+      err "downloaded file is not a working pol binary — not installing"
+      rm -f "$tmp" "$sums"; return 1
+    fi
+    mv -f "$tmp" "$BIN"   # atomic replace, safe while a service runs the old one
+    ok "installed $("$BIN" -version) at $BIN"
   fi
-  rm -f "$sums"
-  chmod 0755 "$tmp"
-  if ! "$tmp" -version >/dev/null 2>&1; then
-    err "downloaded file is not a working pol binary — not installing"
-    rm -f "$tmp"; return 1
-  fi
-  mv -f "$tmp" "$BIN"   # atomic replace, safe while a service runs the old one
   mkdir -p "$CFGDIR"
-  ok "installed $("$BIN" -version) at $BIN"
-  # install this manager as the `poltunnel` command (atomic replace so it is
-  # safe even when the running menu is itself /usr/local/bin/poltunnel)
-  if curl -fsSL "$RAW_URL" -o "$MGR.new" 2>/dev/null && [ -s "$MGR.new" ]; then
+  install_menu "$base" "$sums"
+  rm -f "$sums"
+}
+
+# install_menu installs this manager as the `poltunnel` command. It tries the
+# copy attached to the release first (github.com, checked against
+# SHA256SUMS), then raw.githubusercontent.com, which some networks (Iran)
+# block — that download used to have no timeout and froze the update.
+# The replace is atomic, so it is safe even when the running menu is
+# /usr/local/bin/poltunnel itself.
+install_menu() {
+  local base=$1 sums=$2 src want got
+  for src in "$base/install.sh" "$RAW_URL"; do
+    rm -f "$MGR.new"
+    curl_dl "$src" -o "$MGR.new" 2>/dev/null || continue
+    # a real copy of this script, not an error page or a truncated download
+    [ "$(head -c 19 "$MGR.new")" = "#!/usr/bin/env bash" ] && bash -n "$MGR.new" 2>/dev/null || continue
+    if [ "$src" = "$base/install.sh" ] && [ -s "$sums" ]; then
+      want="$(awk '$2=="install.sh" || $2=="*install.sh" {print $1}' "$sums")"
+      got="$(sha256sum "$MGR.new" | awk '{print $1}')"
+      [ -n "$want" ] && [ "$want" != "$got" ] && continue
+    fi
     chmod 0755 "$MGR.new"; mv -f "$MGR.new" "$MGR"
     ok "menu command installed — just run:  poltunnel"
-  else
-    rm -f "$MGR.new"
-    warn "could not install the 'poltunnel' command (no internet?); the menu still works via the one-liner"
-  fi
+    return 0
+  done
+  rm -f "$MGR.new"
+  warn "could not update the 'poltunnel' menu (download timed out or blocked); pol itself is fine"
 }
 
 ensure_installed() { [ -x "$BIN" ] || { warn "pol is not installed yet"; do_install; }; }
@@ -404,6 +456,7 @@ menu() {
   while true; do
     clear 2>/dev/null || true
     printf '%s%s pol tunnel manager %s %s\n' "$C_B" "$C_CYN" "$C_RESET" "$([ -x "$BIN" ] && "$BIN" -version 2>/dev/null || echo '(not installed)')"
+    if [ -n "${NOTICE:-}" ]; then say "$NOTICE"; NOTICE=""; fi # e.g. the result of the automatic update
     hr
     do_list || true
     hr
@@ -443,16 +496,46 @@ need_root
 # whole call before it runs, so reattaching stdin to the terminal below is safe
 # even when the script itself arrived on stdin (`curl ... | sudo bash`).
 main() {
+  # Non-interactive commands, for piping onto a headless server without the
+  # menu (which needs a terminal and otherwise looks frozen while it waits):
+  #   curl -fsSL URL | sudo bash -s -- update     # install or update pol + the menu
+  case "${1:-}" in
+    install|update)
+      if do_install; then exit 0; else exit 1; fi
+      ;;
+    "" ) ;; # no argument: fall through to the interactive menu
+    * )
+      err "unknown command: $1"
+      say "use:  update   (install/update non-interactively), or no argument for the menu"
+      exit 1
+      ;;
+  esac
   if [ ! -t 0 ]; then
     if { : </dev/tty; } 2>/dev/null; then
       exec </dev/tty
     else
-      err "no terminal to show the menu on. Run it like this:"
-      say "  curl -fsSL $RAW_URL | sudo bash"
-      say "or after install just run:  sudo poltunnel"
+      err "no terminal to show the menu on. To install or update without the menu, run:"
+      say "  curl -fsSL $REL_URL | sudo bash -s -- update"
+      say "or, with a terminal, for the menu:  sudo poltunnel"
       exit 1
     fi
   fi
+  # Run through the one-liner (curl ... | sudo bash) rather than as the
+  # installed `poltunnel`: install or update first — that is what the
+  # one-liner is for — then show the menu. Up to date = only the menu is
+  # refreshed, no binary download.
+  case "$0" in
+    "$MGR" | */poltunnel | poltunnel) ;;
+    *)
+      say "${C_B}checking for updates ...${C_RESET}"
+      if do_install; then
+        NOTICE="${C_GRN}✓${C_RESET} up to date: $("$BIN" -version 2>/dev/null)"
+      else
+        NOTICE="${C_YEL}!${C_RESET} automatic update failed (see above) — option 1 retries it"
+        pause || true
+      fi
+      ;;
+  esac
   menu
 }
 main "$@"
