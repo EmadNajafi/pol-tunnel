@@ -536,7 +536,19 @@ type ctIran struct {
 	best        *ctBest
 	fetchedDone chan struct{}
 	fetchOnce   sync.Once
+	left        chan struct{} // the kharej stopped the test (LEAVE)
+	leftOnce    sync.Once
 	engines     []*ctEngine
+}
+
+// kharejLeft reports whether the kharej stopped the test.
+func (s *ctIran) kharejLeft() bool {
+	select {
+	case <-s.left:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *ctIran) serve() {
@@ -621,6 +633,11 @@ func (s *ctIran) handle(c net.Conn) {
 		if st.Done {
 			s.fetchOnce.Do(func() { close(s.fetchedDone) })
 		}
+	case "LEAVE":
+		// the kharej was stopped: stop here too instead of probing dead
+		// tunnels until every timeout runs out
+		s.leftOnce.Do(func() { close(s.left) })
+		fmt.Fprintln(c, "OK")
 	}
 }
 
@@ -688,7 +705,7 @@ func startCTIran(o ctIranOptions) (*ctIran, error) {
 	secret := make([]byte, ctSecretLen)
 	rand.Read(secret)
 	used := map[int]bool{}
-	s := &ctIran{dir: dir, host: o.Host, joined: make(chan struct{}), fetchedDone: make(chan struct{})}
+	s := &ctIran{dir: dir, host: o.Host, joined: make(chan struct{}), fetchedDone: make(chan struct{}), left: make(chan struct{})}
 	coordPort := ctPickPort(used)
 	s.link = ctLink{Host: o.Host, Port: coordPort, Secret: secret}
 	s.cfg = ctConfig{Echo: ctPickPort(used), Soak: ctSoak, Until: time.Now().Add(ctJoinWait + ctSlack + time.Duration(ctSoak)*ctEchoEvery + ctConnectWait).Unix()}
@@ -784,6 +801,16 @@ func startCTIran(o ctIranOptions) (*ctIran, error) {
 // run waits for the kharej, then tests everything. progress is called with the
 // table whenever it may have changed.
 func (s *ctIran) run(ctx context.Context, progress func([]ctResult)) []ctResult {
+	// a LEAVE from the kharej stops the test like a local Ctrl+C would
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-s.left:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
 	go func() {
@@ -895,9 +922,45 @@ func (s *ctIran) finish(stopped bool) {
 }
 
 // waitFetched gives the kharej a moment to read the verdict before Iran closes.
-func (s *ctIran) waitFetched(d time.Duration) {
+//
+// It returns at once when there is nobody to wait for: the kharej never
+// joined, or it already left (it stopped the test itself). When this side
+// was stopped (Ctrl+C) it only lingers briefly — the kharej polls every
+// ctPollEvery, so a few seconds are enough for it to see the stop — and on a
+// normal finish skip (Ctrl+C) cuts the wait short. Before, it always waited
+// the full d, so a stopped test looked frozen for 20s.
+func (s *ctIran) waitFetched(d time.Duration, stopped bool, skip <-chan struct{}) {
+	select {
+	case <-s.joined:
+	default:
+		return // never joined
+	}
+	select {
+	case <-s.left:
+		return
+	case <-s.fetchedDone:
+		return
+	default:
+	}
+	if stopped {
+		d, skip = 3*ctPollEvery, nil
+	} else {
+		// usually it reads within a poll; say something only if it is slow
+		select {
+		case <-s.fetchedDone:
+			return
+		case <-s.left:
+			return
+		case <-skip:
+			return
+		case <-time.After(2 * ctPollEvery):
+		}
+		fmt.Println("  Waiting for the kharej to read the result… (Ctrl+C to skip)")
+	}
 	select {
 	case <-s.fetchedDone:
+	case <-s.left:
+	case <-skip:
 	case <-time.After(d):
 	}
 }
@@ -1319,9 +1382,38 @@ func ctComputeBest(rows []ctResult, cases []*ctCase) *ctBest {
 
 // ---- Iran: the whole flow ----
 
+// ctSignalContext is cancelled by the first Ctrl+C / SIGTERM / SIGHUP (SIGHUP:
+// a dropped SSH session or a closed terminal must still clean up). A second
+// one quits at once: the engines still go, since they die with this process
+// (Pdeathsig), and the next test reaps anything else left behind.
 func ctSignalContext() (context.Context, context.CancelFunc) {
-	// SIGHUP too: a dropped SSH session or a closed terminal must still clean up
-	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	ctx, cancel := context.WithCancel(context.Background())
+	sig := make(chan os.Signal, 2)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-sig:
+		case <-done:
+			return
+		}
+		fmt.Fprintln(os.Stderr, "\nStopping the test… (Ctrl+C again to quit at once)")
+		cancel()
+		select {
+		case <-sig:
+			fmt.Fprintln(os.Stderr, "Quit.")
+			os.Exit(130)
+		case <-done:
+		}
+	}()
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			signal.Stop(sig)
+			close(done)
+			cancel()
+		})
+	}
 }
 
 // runConnTestIran is `pol -conntest`: start, print the link, test, report.
@@ -1337,6 +1429,7 @@ func runConnTestIran(host string, direct, spoof bool) error {
 	ctx, stop := ctSignalContext()
 	defer stop()
 	ctStage("1", "Preparing test tunnels", "Starting a real pol engine for every transport on free ports.")
+	ctQuietHotplug()
 	if n := ctReapStale(); n > 0 {
 		fmt.Printf("   Stopped %d engine(s) left behind by an earlier test.\n", n)
 	}
@@ -1363,10 +1456,14 @@ func runConnTestIran(host string, direct, spoof bool) error {
 	best := s.best
 	s.mu.Unlock()
 	board.finish(rows, best)
-	if ctx.Err() != nil {
+	stopped := ctx.Err() != nil
+	switch {
+	case s.kharejLeft():
+		fmt.Println("The kharej stopped this test.")
+	case stopped:
 		fmt.Println("Stopped.")
 	}
-	s.waitFetched(20 * time.Second)
+	s.waitFetched(20*time.Second, stopped || s.kharejLeft(), ctx.Done())
 	return nil
 }
 
@@ -1385,7 +1482,14 @@ func ctAsk(ctx context.Context, l ctLink, line string) (string, error) {
 		return "", err
 	}
 	defer c.Close()
-	c.SetDeadline(time.Now().Add(15 * time.Second))
+	deadline := time.Now().Add(15 * time.Second)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	c.SetDeadline(deadline)
+	// a cancelled ctx (Ctrl+C) must not leave us blocked in a read for 15s
+	stop := context.AfterFunc(ctx, func() { c.SetDeadline(time.Now()) })
+	defer stop()
 	rd := bufio.NewReader(io.LimitReader(c, 4<<20))
 	hello, err := rd.ReadString('\n')
 	if err != nil {
@@ -1455,10 +1559,20 @@ func runConnTestKharej(raw string) error {
 	ctx, stop := ctSignalContext()
 	defer stop()
 	ctStage("1", "Connecting to Iran", "Fetching the test settings and starting this side's tunnels.")
+	ctQuietHotplug()
 	if n := ctReapStale(); n > 0 {
 		fmt.Printf("   Stopped %d engine(s) left behind by an earlier test.\n", n)
 	}
 	_, _, err = ctKharejRun(ctx, l, newCTBoard(os.Stdout, l.Host+" ⇄ this server"))
+	if ctx.Err() != nil {
+		// stopped here (Ctrl+C): tell Iran, so it stops now instead of probing
+		// dead tunnels for minutes; best effort, never longer than a moment
+		lctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctAsk(lctx, l, "LEAVE")
+		cancel()
+		fmt.Println("Stopped.")
+		return nil // a requested stop is not a failure (the menu would say so)
+	}
 	return err
 }
 
@@ -1560,6 +1674,7 @@ func ctKharejRun(ctx context.Context, l ctLink, board *ctBoard) ([]ctResult, *ct
 	until := time.Unix(cfg.Until, 0)
 	var last ctStatus
 	lastOK := time.Now()
+	var refusedSince time.Time
 	tag := ""
 	for {
 		if ctx.Err() != nil {
@@ -1578,6 +1693,20 @@ func ctKharejRun(ctx context.Context, l ctLink, board *ctBoard) ([]ctResult, *ct
 		}
 		ans, err := ctAsk(ctx, l, q)
 		if err != nil {
+			// refused = the Iran test process is gone (e.g. quit with a second
+			// Ctrl+C before it could say so): stop soon, not after the 90s
+			// meant for a flaky path
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				if refusedSince.IsZero() {
+					refusedSince = time.Now()
+				}
+				if time.Since(refusedSince) > 5*time.Second {
+					board.abandon()
+					return last.Rows, last.Best, errors.New("the Iran server's test has ended (its coordinator is gone)")
+				}
+			} else {
+				refusedSince = time.Time{}
+			}
 			if time.Since(lastOK) > 90*time.Second {
 				board.abandon()
 				return last.Rows, last.Best, fmt.Errorf("lost the Iran server's coordinator: %w", err)
@@ -1585,7 +1714,7 @@ func ctKharejRun(ctx context.Context, l ctLink, board *ctBoard) ([]ctResult, *ct
 			ctSleep(ctx, ctPollEvery)
 			continue
 		}
-		lastOK = time.Now()
+		lastOK, refusedSince = time.Now(), time.Time{}
 		var st ctStatus
 		if json.Unmarshal([]byte(ans), &st) == nil {
 			last = st
