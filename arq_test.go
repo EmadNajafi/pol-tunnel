@@ -196,3 +196,33 @@ func name(f float64) string {
 		return "loss30"
 	}
 }
+
+// A reader that stops reading must make the sender stop too (bounded
+// buffering), and the stream must resume intact once it reads again.
+func TestARQSlowReaderBounded(t *testing.T) {
+	l := newLink(0)
+	defer l.a.Close()
+	defer l.b.Close()
+
+	const total = 16 << 20 // far more than the receive window
+	msg := make([]byte, total)
+	rand.Read(msg)
+	go func() { l.a.Write(msg); l.a.CloseWrite() }()
+
+	time.Sleep(1500 * time.Millisecond) // b reads nothing meanwhile
+	l.b.mu.Lock()
+	backlog := len(l.b.rStream)
+	l.b.mu.Unlock()
+	if limit := 2 * arqRecvWnd * arqMTU; backlog > limit {
+		t.Fatalf("unread backlog %d bytes exceeds %d: receive window ignores unread data", backlog, limit)
+	}
+
+	l.b.SetReadDeadline(time.Now().Add(60 * time.Second))
+	got, err := io.ReadAll(l.b)
+	if err != nil {
+		t.Fatalf("read: %v (got %d of %d)", err, len(got), total)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("stream corrupted: got %d bytes", len(got))
+	}
+}

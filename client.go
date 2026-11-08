@@ -209,7 +209,9 @@ func (c *Client) handle(t io.ReadWriteCloser, proto byte, addr, src string) {
 		}
 		tuneTCP(dst, &c.cfg.Common)
 		if c.cfg.ProxyProtocol && src != "" {
-			if hdr := buildProxyV2(src, addr); hdr != nil {
+			// the dialed conn's address, not addr: a hostname target
+			// ("backend:443") has no IP, and the header would be skipped
+			if hdr := buildProxyV2(src, dst.RemoteAddr().String()); hdr != nil {
 				if _, err := dst.Write(hdr); err != nil {
 					logf("warn", "proxy-protocol write %s: %v", addr, err)
 					dst.Close()

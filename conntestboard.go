@@ -74,9 +74,9 @@ func ctStatusLabel(r ctResult) string {
 }
 
 // every mark takes two columns; the rest of the RESULT column is spaces
-const ctRowFormat = "%s       %-9s %-12s %-9s %-7s %s"
+const ctRowFormat = "%s       %-9s %-14s %-9s %-7s %s"
 
-var ctHeader = fmt.Sprintf("%-8s %-9s %-12s %-9s %-7s %s", "RESULT", "KIND", "NAME", "STATUS", "ECHOES", "PROGRESS")
+var ctHeader = fmt.Sprintf("%-8s %-9s %-14s %-9s %-7s %s", "RESULT", "KIND", "NAME", "STATUS", "ECHOES", "PROGRESS")
 
 func ctRow(r ctResult) string {
 	total := r.Total

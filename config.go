@@ -279,6 +279,18 @@ func loadCommon(s section) Common {
 	if c.Heartbeat < time.Second {
 		c.Heartbeat = time.Second
 	}
+	// Zero or negative values here break things silently or crash: a 0
+	// channel_size drops every pooled data conn (and a negative one panics in
+	// make), a 0 udp_idle_timeout/dial_timeout times out every UDP read/dial.
+	if c.ChannelSize < 1 {
+		c.ChannelSize = defaultCommon().ChannelSize
+	}
+	if c.DialTimeout <= 0 {
+		c.DialTimeout = defaultCommon().DialTimeout
+	}
+	if c.UDPIdle <= 0 {
+		c.UDPIdle = defaultCommon().UDPIdle
+	}
 	return c
 }
 

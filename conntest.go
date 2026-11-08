@@ -270,6 +270,7 @@ func startCTEngine(dir, name, cfg string) (*ctEngine, error) {
 	cmd := exec.Command(exe, "-c", cfgPath)
 	cmd.Stdout, cmd.Stderr = lf, lf
 	cmd.Env = append(os.Environ(), ctEngineEnv...)
+	cmd.SysProcAttr = ctEngineSysProcAttr() // the engine dies with the test, never outlives it
 	if err := cmd.Start(); err != nil {
 		lf.Close()
 		return nil, err
@@ -1319,7 +1320,8 @@ func ctComputeBest(rows []ctResult, cases []*ctCase) *ctBest {
 // ---- Iran: the whole flow ----
 
 func ctSignalContext() (context.Context, context.CancelFunc) {
-	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// SIGHUP too: a dropped SSH session or a closed terminal must still clean up
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 }
 
 // runConnTestIran is `pol -conntest`: start, print the link, test, report.
@@ -1330,14 +1332,19 @@ func runConnTestIran(host string, direct, spoof bool) error {
 	if host == "" {
 		return errors.New("could not tell this server's address; pass it with -conntest-host")
 	}
+	// catch Ctrl+C / SIGHUP before any engine starts, so stopping during
+	// startup still runs the cleanup below
+	ctx, stop := ctSignalContext()
+	defer stop()
 	ctStage("1", "Preparing test tunnels", "Starting a real pol engine for every transport on free ports.")
+	if n := ctReapStale(); n > 0 {
+		fmt.Printf("   Stopped %d engine(s) left behind by an earlier test.\n", n)
+	}
 	s, err := startCTIran(ctIranOptions{Host: host, Direct: direct, Spoof: spoof})
 	if err != nil {
 		return err
 	}
 	defer s.close()
-	ctx, stop := ctSignalContext()
-	defer stop()
 
 	fmt.Println()
 	ctStage("2", "Connect the kharej", "On the kharej server run Connection Test → Kharej and paste this link:")
@@ -1448,6 +1455,9 @@ func runConnTestKharej(raw string) error {
 	ctx, stop := ctSignalContext()
 	defer stop()
 	ctStage("1", "Connecting to Iran", "Fetching the test settings and starting this side's tunnels.")
+	if n := ctReapStale(); n > 0 {
+		fmt.Printf("   Stopped %d engine(s) left behind by an earlier test.\n", n)
+	}
 	_, _, err = ctKharejRun(ctx, l, newCTBoard(os.Stdout, l.Host+" ⇄ this server"))
 	return err
 }

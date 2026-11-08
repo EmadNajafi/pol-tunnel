@@ -28,7 +28,10 @@ type aeadConn struct {
 	expect  uint64 // next record counter we require (anti-replay for the stream)
 }
 
-const aeadMaxRecord = 64 * 1024
+// aeadMaxRecord is the most plaintext one record carries: the sealed record
+// (nonce + ciphertext + tag) must fit the uint16 length prefix. A larger value
+// silently wraps the length and corrupts the stream (e.g. a 64 KiB mux frame).
+const aeadMaxRecord = 0xffff - gcmNonce - gcmTag
 
 func newAEADConn(c net.Conn, keys *directKeys) *aeadConn {
 	return &aeadConn{Conn: c, keys: keys, expect: 1}
