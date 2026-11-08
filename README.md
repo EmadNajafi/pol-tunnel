@@ -60,6 +60,14 @@ UDP روی stream:  len[2] | datagram
 curl -fsSL https://raw.githubusercontent.com/EmadNajafi/pol-tunnel/main/install.sh | sudo bash
 ```
 
+**روی سرور ایران** (که `raw.githubusercontent.com` رویش فیلتر است) همین را از Releases بگیر — از `github.com` می‌آید:
+
+```bash
+curl -fsSL https://github.com/EmadNajafi/pol-tunnel/releases/latest/download/install.sh | sudo bash
+```
+
+این دستور هر بار **اول خودش pol و منو را به آخرین نسخه آپدیت می‌کند** (اگر از قبل آخرین نسخه باشد، چیزی دانلود نمی‌کند) و بعد منو را باز می‌کند.
+
 بعد از نصب، هر وقت خواستی منو را باز کنی فقط کافی است بزنی:
 
 ```bash
@@ -69,7 +77,7 @@ poltunnel
 **نصب/آپدیت بدون منو** (برای سروری که منوی تعاملی رویش گیر می‌کند یا ترمینال تعاملی نداری — فقط باینری و منو را به آخرین نسخه می‌رساند و بیرون می‌آید):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/EmadNajafi/pol-tunnel/main/install.sh | sudo bash -s -- update
+curl -fsSL https://github.com/EmadNajafi/pol-tunnel/releases/latest/download/install.sh | sudo bash -s -- update
 ```
 
 **یا دستی:** باینری‌های لینوکس (`pol-linux-amd64`، `pol-linux-arm64`) به‌همراه `SHA256SUMS` در [Releases](https://github.com/EmadNajafi/pol-tunnel/releases) هستند (اسکریپت نصب checksum را خودش بررسی می‌کند). یا خودتان build کنید:
