@@ -3,12 +3,50 @@ package main
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
+
+// ctUdevRule keeps the test's short-lived polct-* TUN interfaces away from
+// hotplug hooks — in particular cloud-init's network hotplug hook
+// (90-cloud-init-hook-hotplug.rules, common on OpenStack images). That hook
+// runs a full cloud-init per new interface, ~50s each and queued, with bursts
+// of 100% CPU: on a 1-vCPU VM the server stalls for seconds right when a test
+// starts or is stopped. 91-* runs after it and replaces the RUN list (=, not
+// +=) for matching devices only, so the hook is dropped; 99-systemd.rules
+// still adds its own RUN afterwards. (OPTIONS+="last_rule" is gone from
+// systemd, so it cannot be used.) The rule lives in /run (gone at reboot) and
+// stays there, so a test killed outright still leaves its devices quiet.
+const (
+	ctUdevRulePath = "/run/udev/rules.d/91-pol-conntest.rules"
+	ctUdevRule     = "# pol connection test: keep its short-lived polct-* TUN interfaces away from\n" +
+		"# hotplug hooks (cloud-init would run once per interface and stall a small VM).\n" +
+		"ACTION==\"add\", SUBSYSTEM==\"net\", KERNEL==\"polct-*\", RUN=\"/bin/true\"\n"
+)
+
+func ctQuietHotplug() {
+	if os.Geteuid() != 0 {
+		return
+	}
+	if _, err := os.Stat("/run/udev"); err != nil {
+		return // no udev
+	}
+	if b, err := os.ReadFile(ctUdevRulePath); err == nil && string(b) == ctUdevRule {
+		return
+	}
+	if os.MkdirAll(filepath.Dir(ctUdevRulePath), 0o755) != nil {
+		return
+	}
+	if os.WriteFile(ctUdevRulePath, []byte(ctUdevRule), 0o644) != nil {
+		return
+	}
+	// udevd notices changed rules on its own; reload to be sure (best effort)
+	exec.Command("udevadm", "control", "--reload").Run()
+}
 
 // ctEngineSysProcAttr makes the kernel send SIGTERM to an engine when the test
 // process dies for any reason (SSH dropped = SIGHUP, terminal closed, kill -9,

@@ -7,3 +7,5 @@ import "syscall"
 func ctEngineSysProcAttr() *syscall.SysProcAttr { return nil }
 
 func ctReapStale() int { return 0 }
+
+func ctQuietHotplug() {}
