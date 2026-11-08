@@ -17,6 +17,10 @@ CFGDIR="/etc/pol"
 VERSION_TAG="latest"
 RAW_URL="https://raw.githubusercontent.com/$REPO/main/install.sh"
 
+# Downloads with timeouts, so a slow or blocked network fails with a message
+# instead of hanging the installer (which looks like a freeze).
+curl_dl() { curl -fsSL --connect-timeout 15 --max-time 180 "$@"; }
+
 C_RESET=$'\e[0m'; C_B=$'\e[1m'; C_GRN=$'\e[32m'; C_YEL=$'\e[33m'; C_RED=$'\e[31m'; C_CYN=$'\e[36m'; C_DIM=$'\e[2m'
 
 say()  { printf '%s\n' "$*"; }
@@ -54,12 +58,12 @@ do_install() {
   say "downloading pol ($arch) ..."
   # temp file next to the target: same filesystem, and not on a noexec /tmp
   tmp="$(mktemp "$BIN.XXXXXX")"; sums="$(mktemp)"
-  if ! curl -fsSL "$url" -o "$tmp"; then
-    err "download failed from $url"
+  if ! curl_dl "$url" -o "$tmp"; then
+    err "download failed from $url (timed out or unreachable)"
     rm -f "$tmp" "$sums"; return 1
   fi
   # verify against the release's SHA256SUMS (catches truncated/corrupted downloads)
-  if curl -fsSL "$base/SHA256SUMS" -o "$sums" 2>/dev/null && [ -s "$sums" ]; then
+  if curl_dl "$base/SHA256SUMS" -o "$sums" 2>/dev/null && [ -s "$sums" ]; then
     want="$(awk -v f="pol-linux-$arch" '$2==f || $2=="*"f {print $1}' "$sums")"
     got="$(sha256sum "$tmp" | awk '{print $1}')"
     if [ -z "$want" ] || [ "$want" != "$got" ]; then
@@ -81,7 +85,7 @@ do_install() {
   ok "installed $("$BIN" -version) at $BIN"
   # install this manager as the `poltunnel` command (atomic replace so it is
   # safe even when the running menu is itself /usr/local/bin/poltunnel)
-  if curl -fsSL "$RAW_URL" -o "$MGR.new" 2>/dev/null && [ -s "$MGR.new" ]; then
+  if curl_dl "$RAW_URL" -o "$MGR.new" 2>/dev/null && [ -s "$MGR.new" ]; then
     chmod 0755 "$MGR.new"; mv -f "$MGR.new" "$MGR"
     ok "menu command installed — just run:  poltunnel"
   else
@@ -443,13 +447,27 @@ need_root
 # whole call before it runs, so reattaching stdin to the terminal below is safe
 # even when the script itself arrived on stdin (`curl ... | sudo bash`).
 main() {
+  # Non-interactive commands, for piping onto a headless server without the
+  # menu (which needs a terminal and otherwise looks frozen while it waits):
+  #   curl -fsSL URL | sudo bash -s -- update     # install or update pol + the menu
+  case "${1:-}" in
+    install|update)
+      if do_install; then exit 0; else exit 1; fi
+      ;;
+    "" ) ;; # no argument: fall through to the interactive menu
+    * )
+      err "unknown command: $1"
+      say "use:  update   (install/update non-interactively), or no argument for the menu"
+      exit 1
+      ;;
+  esac
   if [ ! -t 0 ]; then
     if { : </dev/tty; } 2>/dev/null; then
       exec </dev/tty
     else
-      err "no terminal to show the menu on. Run it like this:"
-      say "  curl -fsSL $RAW_URL | sudo bash"
-      say "or after install just run:  sudo poltunnel"
+      err "no terminal to show the menu on. To install or update without the menu, run:"
+      say "  curl -fsSL $RAW_URL | sudo bash -s -- update"
+      say "or, with a terminal, for the menu:  sudo poltunnel"
       exit 1
     fi
   fi

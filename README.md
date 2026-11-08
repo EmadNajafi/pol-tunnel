@@ -66,6 +66,12 @@ curl -fsSL https://raw.githubusercontent.com/EmadNajafi/pol-tunnel/main/install.
 poltunnel
 ```
 
+**نصب/آپدیت بدون منو** (برای سروری که منوی تعاملی رویش گیر می‌کند یا ترمینال تعاملی نداری — فقط باینری و منو را به آخرین نسخه می‌رساند و بیرون می‌آید):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/EmadNajafi/pol-tunnel/main/install.sh | sudo bash -s -- update
+```
+
 **یا دستی:** باینری‌های لینوکس (`pol-linux-amd64`، `pol-linux-arm64`) به‌همراه `SHA256SUMS` در [Releases](https://github.com/EmadNajafi/pol-tunnel/releases) هستند (اسکریپت نصب checksum را خودش بررسی می‌کند). یا خودتان build کنید:
 
 ```bash
