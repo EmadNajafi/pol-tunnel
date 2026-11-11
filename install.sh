@@ -460,7 +460,7 @@ update_note() {
   tag="$(cat "$LATEST_CACHE" 2>/dev/null || true)"
   cur="$([ -x "$BIN" ] && "$BIN" -version 2>/dev/null | awk '{print $2}' || true)"
   if [ -n "$tag" ] && [ -n "$cur" ] && [ "v$cur" != "$tag" ]; then
-    printf '%s%s is available%s — press %su%s to update' "$C_YEL" "$tag" "$C_RESET" "$C_B" "$C_RESET"
+    printf '%s%s is available%s — choose %s5%s (Install / update)' "$C_YEL" "$tag" "$C_RESET" "$C_B" "$C_RESET"
   fi
 }
 
@@ -513,7 +513,7 @@ show_join() {
   case "$(tunnel_kind "$CFGDIR/$n.toml")" in direct*) type=Direct ;; esac
   say "  On the Kharej server:"
   say "    1. run the same installer (or ${C_B}poltunnel${C_RESET})"
-  say "    2. press ${C_B}n${C_RESET} (new tunnel), then ${C_B}$type${C_RESET} -> ${C_B}Kharej${C_RESET} -> ${C_B}Join code${C_RESET}"
+  say "    2. choose ${C_B}1${C_RESET} (New tunnel), then ${C_B}$type${C_RESET} -> ${C_B}Kharej${C_RESET} -> ${C_B}Join code${C_RESET}"
   say "    3. paste the code"
   hint "Keep the code private: it contains the tunnel's token."
 }
@@ -955,24 +955,30 @@ draw_tunnel() {
     fi
   fi
   if stale_tunnels | grep -qx "$n"; then
-    kv note "${C_YEL}still running the previous pol version — restart it (r)${C_RESET}"
+    kv note "${C_YEL}still running the previous pol version — choose Restart below${C_RESET}"
   fi
   kv config "$f"
   section "Recent log"
   journalctl -u "pol-$n.service" --no-pager -n 6 -o cat 2>/dev/null | cut -c1-"$(($(ui_width) - 4))" | sed 's/^/    /' || true
   echo
   hr
-  local tw=stop
-  if [ "$(systemctl is-active "pol-$n.service" 2>/dev/null || true)" != active ]; then tw=start; fi
-  printf '  %sr%s restart   %ss%s %s   %sl%s live log   %sc%s show config   %se%s edit config\n' \
-    "$C_CYN" "$C_RESET" "$C_CYN" "$C_RESET" "$tw" "$C_CYN" "$C_RESET" "$C_CYN" "$C_RESET" "$C_CYN" "$C_RESET"
+  # the actions, one per line, picked by number (only the ones this tunnel has)
+  local items=() toggle="stop|Stop|stop the tunnel (it stays configured)"
+  if [ "$(systemctl is-active "pol-$n.service" 2>/dev/null || true)" != active ]; then toggle="start|Start|start the tunnel"; fi
+  items+=("restart|Restart|stop and start again — also applies a new pol version")
+  items+=("$toggle")
+  items+=("log|Live log|watch the log as it happens (Ctrl+C to come back)")
+  items+=("config|Show config|print the config file, token included")
+  items+=("edit|Edit config|change it in an editor; checked before it is saved")
   case "$kind" in
-    "reverse server") printf '  %sp%s performance profile   %sj%s join code for the Kharej server   %sd%s delete\n' "$C_CYN" "$C_RESET" "$C_CYN" "$C_RESET" "$C_CYN" "$C_RESET" ;;
-    "reverse client") printf '  %sp%s performance profile   %sd%s delete\n' "$C_CYN" "$C_RESET" "$C_CYN" "$C_RESET" ;;
-    "direct server") printf '  %sj%s join code for the Kharej server   %sd%s delete\n' "$C_CYN" "$C_RESET" "$C_CYN" "$C_RESET" ;;
-    *) printf '  %sd%s delete\n' "$C_CYN" "$C_RESET" ;;
+    reverse*) items+=("perf|Performance profile|balance / turbo / aggressive / throughput") ;;
   esac
-  printf '  %sEnter%s back to the list\n' "$C_CYN" "$C_RESET"
+  case "$kind" in
+    *server) items+=("join|Join code|the code to paste on the Kharej server") ;;
+  esac
+  items+=("delete|Delete|remove this tunnel and its config")
+  menu_list "${items[@]}"
+  printf '   %s 0)%s Back\n' "$C_CYN" "$C_RESET"
 }
 
 tunnel_screen() {
@@ -980,27 +986,19 @@ tunnel_screen() {
   while true; do
     if [ ! -f "$CFGDIR/$n.toml" ]; then return 0; fi
     draw_tunnel "$n"
-    read -rp $'\n> ' a || return 0
-    case "${a,,}" in
-      "" | b | q | 0) return 0 ;;
-      r) if systemctl restart "pol-$n.service"; then ok "restarted"; else err "restart failed"; fi; sleep 1 ;;
-      s)
-        if [ "$(systemctl is-active "pol-$n.service" 2>/dev/null || true)" = active ]; then
-          if systemctl stop "pol-$n.service"; then ok "stopped"; else err "stop failed"; fi
-        else
-          if systemctl start "pol-$n.service"; then ok "started"; else err "start failed"; fi
-        fi
-        sleep 1 ;;
-      l) live_logs "$n" ;;
-      c) section "$CFGDIR/$n.toml"; sed 's/^/    /' "$CFGDIR/$n.toml"; pause ;;
-      e) run_action edit_config "$n" ;;
-      p) run_action set_performance "$n" ;;
-      j) case "$(tunnel_kind "$CFGDIR/$n.toml")" in
-           *server) run_action show_join "$n" ;;
-           *) warn "the join code is made on the server side"; sleep 1 ;;
-         esac ;;
-      d) if confirm_delete "$n"; then remove_tunnel "$n"; ok "tunnel '$n' deleted"; sleep 1; return 0; else sleep 1; fi ;;
-      *) ;;
+    read -rp "$(printf '\n  choice (Enter = refresh): ')" a || return 0
+    if [ "$a" = 0 ] || [ "${a,,}" = b ] || [ "${a,,}" = q ]; then return 0; fi
+    case "$(menu_key "$a")" in
+      restart) if systemctl restart "pol-$n.service"; then ok "restarted"; else err "restart failed"; fi; sleep 1 ;;
+      stop) if systemctl stop "pol-$n.service"; then ok "stopped"; else err "stop failed"; fi; sleep 1 ;;
+      start) if systemctl start "pol-$n.service"; then ok "started"; else err "start failed"; fi; sleep 1 ;;
+      log) live_logs "$n" ;;
+      config) section "$CFGDIR/$n.toml"; sed 's/^/    /' "$CFGDIR/$n.toml"; pause ;;
+      edit) run_action edit_config "$n" ;;
+      perf) run_action set_performance "$n" ;;
+      join) run_action show_join "$n" ;;
+      delete) if confirm_delete "$n"; then remove_tunnel "$n"; ok "tunnel '$n' deleted"; sleep 1; return 0; else sleep 1; fi ;;
+      *) if [ -n "$a" ]; then err "choose a number from the list"; sleep 1; fi ;;
     esac
   done
 }
@@ -1070,10 +1068,30 @@ run_action() {
   pause || true
 }
 
+# ---- menus: one option per line, picked by its number ----
+# menu_list "key|label|description" ... prints the list and remembers the keys
+# in MENU_KEYS; menu_key <answer> turns the number typed back into its key.
+MENU_KEYS=()
+menu_list() {
+  local i=1 o k l d
+  MENU_KEYS=()
+  for o in "$@"; do
+    IFS='|' read -r k l d <<<"$o"
+    MENU_KEYS+=("$k")
+    printf '   %s%2d)%s %-20s %s%s%s\n' "$C_CYN" "$i" "$C_RESET" "$l" "$C_DIM" "$d" "$C_RESET"
+    i=$((i + 1))
+  done
+}
+menu_key() {
+  if [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le ${#MENU_KEYS[@]} ]; then
+    printf '%s' "${MENU_KEYS[$(($1 - 1))]}"
+  fi
+}
+
 # ---- the main screen ----
 NAMES=()
 draw_main() {
-  local n i=0 f kind via prof os host ip note
+  local n f kind via prof os host ip note
   clear 2>/dev/null || true
   banner
   host="$(hostname 2>/dev/null || true)"; ip="$(public_ip)"
@@ -1087,35 +1105,65 @@ draw_main() {
   NAMES=()
   for n in $(list_names); do NAMES+=("$n"); done
   if [ ${#NAMES[@]} -eq 0 ]; then
-    hint "none yet — press n to create the first one"
+    hint "none yet — choose 1 to create the first one"
     hint "(set up the Iran server first, then the Kharej server with its join code)"
   else
-    printf '  %s%-3s %-12s %-15s %-9s %-11s %s%s\n' "$C_DIM" "#" "NAME" "KIND" "VIA" "PROFILE" "STATE" "$C_RESET"
+    printf '  %s%-12s %-15s %-9s %-11s %s%s\n' "$C_DIM" "NAME" "KIND" "VIA" "PROFILE" "STATE" "$C_RESET"
     for n in "${NAMES[@]}"; do
-      i=$((i + 1)); f="$CFGDIR/$n.toml"
+      f="$CFGDIR/$n.toml"
       kind="$(tunnel_kind "$f")"
       case "$kind" in
         direct*) via="$(cfg_get "$f" carrier)"; prof="-" ;;
         *) via="$(cfg_get "$f" transport)"; prof="$(cfg_get "$f" performance)" ;;
       esac
       tunnel_state "$n"
-      printf '  %s%-3s%s %-12s %-15s %-9s %-11s %s%s%s\n' "$C_CYN" "$i" "$C_RESET" "${n:0:12}" "$(kind_label "$kind")" "${via:-?}" "${prof:-balance}" "$ST_COLOR" "$ST_TEXT" "$C_RESET"
+      printf '  %-12s %-15s %-9s %-11s %s%s%s\n' "${n:0:12}" "$(kind_label "$kind")" "${via:-?}" "${prof:-balance}" "$ST_COLOR" "$ST_TEXT" "$C_RESET"
     done
     if [ -n "$(stale_tunnels)" ]; then
-      printf '  %s! some tunnels still run the previous pol version — open one and restart it%s\n' "$C_YEL" "$C_RESET"
+      printf '  %s! some tunnels still run the previous pol version — choose 2, open one and restart it%s\n' "$C_YEL" "$C_RESET"
     fi
   fi
-  echo
-  hr
-  if [ ${#NAMES[@]} -gt 0 ]; then
-    printf '  %s1-%d%s open a tunnel   %sn%s new tunnel   %st%s connection test   %sl%s link test\n' \
-      "$C_CYN" "${#NAMES[@]}" "$C_RESET" "$C_CYN" "$C_RESET" "$C_CYN" "$C_RESET" "$C_CYN" "$C_RESET"
-  else
-    printf '  %sn%s new tunnel   %st%s connection test   %sl%s link test\n' "$C_CYN" "$C_RESET" "$C_CYN" "$C_RESET" "$C_CYN" "$C_RESET"
+
+  section "MENU"
+  menu_list \
+    "new|New tunnel|create a reverse or direct tunnel" \
+    "manage|Manage a tunnel|restart, log, config, profile, join code, delete" \
+    "conntest|Connection test|which kinds of tunnel work between the two servers" \
+    "linktest|Link test|latency, jitter and loss to the other server" \
+    "update|Install / update|get the newest pol and this menu" \
+    "uninstall|Uninstall|remove pol and every tunnel"
+  printf '   %s 0)%s Exit\n' "$C_CYN" "$C_RESET"
+  if [ -x "$MGR" ]; then printf '\n  %sreopen this menu any time with: poltunnel%s\n' "$C_DIM" "$C_RESET"; fi
+}
+
+# manage_tunnel — pick a tunnel (asked only when there is more than one) and
+# open its screen
+manage_tunnel() {
+  local n a items=() names=()
+  for n in $(list_names); do names+=("$n"); done
+  if [ ${#names[@]} -eq 0 ]; then
+    warn "there are no tunnels yet — choose 1 (New tunnel) first"
+    pause || true
+    return 0
   fi
-  printf '  %su%s install / update   %sx%s uninstall   %sq%s quit' "$C_CYN" "$C_RESET" "$C_CYN" "$C_RESET" "$C_CYN" "$C_RESET"
-  if [ -x "$MGR" ]; then printf '        %s(reopen any time: poltunnel)%s' "$C_DIM" "$C_RESET"; fi
-  echo
+  if [ ${#names[@]} -eq 1 ]; then tunnel_screen "${names[0]}"; return 0; fi
+  while true; do
+    clear 2>/dev/null || true
+    banner
+    section "Which tunnel?"
+    items=()
+    for n in "${names[@]}"; do
+      tunnel_state "$n"
+      items+=("$n|$n|$(kind_label "$(tunnel_kind "$CFGDIR/$n.toml")")   $ST_TEXT")
+    done
+    menu_list "${items[@]}"
+    printf '   %s 0)%s Back\n' "$C_CYN" "$C_RESET"
+    read -rp "$(printf '\n  choice: ')" a || return 0
+    if [ "$a" = 0 ] || [ -z "$a" ]; then return 0; fi
+    n="$(menu_key "$a")"
+    if [ -n "$n" ]; then tunnel_screen "$n"; return 0; fi
+    err "choose a number from the list"; sleep 1
+  done
 }
 
 menu() {
@@ -1123,20 +1171,18 @@ menu() {
   refresh_latest || true
   while true; do
     draw_main
-    read -rp $'\n> ' c || { echo; exit 0; } # exit cleanly on EOF (non-interactive)
+    read -rp "$(printf '\n  choice: ')" c || { echo; exit 0; } # exit cleanly on EOF (non-interactive)
+    if [ "$c" = 0 ] || [ "${c,,}" = q ] || [ "${c,,}" = exit ]; then exit 0; fi
     # A failing action must report and return to the menu, not exit the script
     # (under `set -e` any non-zero return here used to close the menu silently).
-    case "${c,,}" in
-      n) run_action do_create ;;
-      t) run_action do_conntest ;;
-      l) run_action do_linktest ;;
-      u) run_action do_install; rm -f "$LATEST_CACHE"; refresh_latest || true ;;
-      x) run_action do_uninstall ;;
-      q | 0 | exit) exit 0 ;;
-      *)
-        if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le ${#NAMES[@]} ]; then
-          tunnel_screen "${NAMES[$((c - 1))]}" || true
-        fi ;;
+    case "$(menu_key "$c")" in
+      new) run_action do_create ;;
+      manage) manage_tunnel || true ;;
+      conntest) run_action do_conntest ;;
+      linktest) run_action do_linktest ;;
+      update) run_action do_install; rm -f "$LATEST_CACHE"; refresh_latest || true ;;
+      uninstall) run_action do_uninstall ;;
+      *) if [ -n "$c" ]; then err "choose a number from the list"; sleep 1; fi ;;
     esac
   done
 }
@@ -1184,7 +1230,7 @@ main() {
       if do_install; then
         NOTICE="${C_GRN}✓${C_RESET} up to date: $("$BIN" -version 2>/dev/null)"
       else
-        NOTICE="${C_YEL}!${C_RESET} automatic update failed (see above) — press u to retry"
+        NOTICE="${C_YEL}!${C_RESET} automatic update failed (see above) — choose 5 to retry"
         pause || true
       fi
       ;;
