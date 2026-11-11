@@ -70,6 +70,7 @@ func main() {
 	errc := make(chan error, 2)
 	if cfg.Server != nil {
 		setLogLevel(cfg.Server.LogLevel)
+		applyARQProfile(cfg.Server.Performance)
 		srv, err := NewServer(cfg.Server)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "config:", err)
@@ -79,6 +80,7 @@ func main() {
 	}
 	if cfg.Client != nil {
 		setLogLevel(cfg.Client.LogLevel)
+		applyARQProfile(cfg.Client.Performance)
 		go func() { errc <- NewClient(cfg.Client).Run() }()
 	}
 	if cfg.Direct != nil {

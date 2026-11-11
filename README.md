@@ -153,6 +153,28 @@ recommendation:
 نمونه کانفیگ‌ها در [examples/server.toml](examples/server.toml) و [examples/client.toml](examples/client.toml) هستند.
 توکن و `transport` باید در هر دو طرف یکی باشند.
 
+### پروفایل Performance (مثل preset های BackPack)
+
+یک کلمه در `[server]` و `[client]` همه‌ی تنظیمات سرعت را یک‌جا پر می‌کند:
+
+```toml
+performance = "turbo"     # balance | turbo | aggressive | throughput
+```
+
+| پروفایل | برای چه | `mux_window` | `connection_pool` | ARQ (spoof / spoofmux) |
+|---|---|---|---|---|
+| `balance` (پیش‌فرض) | سرور کوچک یا اشتراکی؛ کم‌مصرف | 512 KiB | 8 | پنجره ۱۰۲۴، ACK فوری |
+| `turbo` | انتخاب معمول | 2 MiB | 8 | شروع سریع‌تر، ارسال مجدد زودتر |
+| `aggressive` | بیشترین فشار، حتی روی مسیر پر‌افت؛ RAM و CPU بیشتر | 8 MiB | 16 | پنجره ۲۰۴۸، عقب‌نشینی کمتر |
+| `throughput` | انتقال حجیم (دانلود/آپلود)، نه بازی | 16 MiB | 8 | پنجره ۴۰۹۶، ACK دسته‌ای، تیک ۲۰ms، Nagle روشن |
+
+- هر کلیدی که خودت در کانفیگ بنویسی (`mux_window`، `connection_pool`، `nodelay`، …) بر پروفایل مقدم است.
+- کانفیگی که `performance` ندارد دقیقاً مثل قبل (`balance`) کار می‌کند.
+- روی هر دو سرور یک پروفایل بگذار: هر جهت را پنجره‌ی گیرنده‌ی همان جهت محدود می‌کند.
+- روی ترنسپورت‌های mux، سرعت هر اتصال حدوداً «`mux_window` ÷ زمان رفت‌وبرگشت» است؛ با RTT حدود ۸۰ms یعنی حدود ۴۵ Mbit/s با `balance` و ۱۸۰ Mbit/s با `turbo`.
+- `mux_window` سقف بافر **هر اتصال** است؛ `aggressive` و `throughput` روی سرور کم‌رم با اتصال‌های کندِ زیاد می‌توانند حافظه‌ی زیادی بگیرند.
+- تانل direct (L3) پروفایل ندارد.
+
 ### سینتکس پورت‌ها (مثل Backhaul)
 
 | ورودی | معنی |

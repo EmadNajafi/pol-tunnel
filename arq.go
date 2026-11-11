@@ -32,17 +32,29 @@ const (
 
 	flagFIN = 1 << 0
 
-	arqHeader  = 14
-	arqMTU     = 1200 // payload bytes per segment
-	arqRecvWnd = 1024 // advertised receive window (segments)
-	arqSendCap = 1024 // max unacked+queued segments before Write blocks
+	arqHeader = 14
+	arqMTU    = 1200 // payload bytes per segment
 
+	maxRTO     = 8 * time.Second
+	idleKeepTk = 50 // ticks (×interval) of idleness before a keepalive PING
+)
+
+// ARQ tuning. These are the "balance" values; a performance profile replaces
+// them once at startup, before any conn exists (see performance.go). Each side
+// tunes itself: the window is advertised on the wire, so the two ends need not
+// match.
+var (
+	arqRecvWnd  = 1024 // advertised receive window (segments, at most 65535)
+	arqSendCap  = 1024 // max unacked+queued segments before Write blocks
+	arqInitCwnd = 32   // congestion window a new conn starts with (segments)
+	cwndFloor   = 8    // keep throughput on genuinely lossy links (KCP-style, gentle)
+	fastResend  = 3    // duplicate acks before a fast retransmit
 	minRTO      = 50 * time.Millisecond
-	maxRTO      = 8 * time.Second
-	cwndFloor   = 8 // keep throughput on genuinely lossy links (KCP-style, gentle)
-	fastResend  = 3
 	arqInterval = 10 * time.Millisecond
-	idleKeepTk  = 50 // ticks (×interval) of idleness before a keepalive PING
+	// arqDelayAck batches acks on the tick instead of sending one per packet
+	// the moment it arrives: fewer packets and less CPU, slightly slower loss
+	// recovery (the bulk-transfer profile).
+	arqDelayAck = false
 )
 
 type seg struct {
@@ -101,9 +113,9 @@ func newARQ(send func([]byte) error, local, remote net.Addr) *arqConn {
 	c := &arqConn{
 		send: send, local: local, remote: remote,
 		wk:          make(chan struct{}, 1),
-		rmtWnd:      arqRecvWnd,
-		lastWndSent: arqRecvWnd,
-		cwnd:        32,
+		rmtWnd:      uint32(arqRecvWnd),
+		lastWndSent: uint16(arqRecvWnd),
+		cwnd:        arqInitCwnd,
 		ssthresh:    1 << 20,
 		rcvBuf:      map[uint32]*seg{},
 	}
@@ -184,7 +196,9 @@ func (c *arqConn) input(data []byte) {
 			woke = true
 		case arqPush:
 			c.onPush(seqn, flags, payload)
-			woke = true
+			if !arqDelayAck { // batched acks go out on the next tick instead
+				woke = true
+			}
 		case arqPing:
 		case arqRST:
 			c.failLocked(errPeerReset)
@@ -271,7 +285,7 @@ func (c *arqConn) backoff(timeout bool) {
 
 func (c *arqConn) onPush(seq uint32, flags byte, payload []byte) {
 	c.acks = append(c.acks, seq) // ack even duplicates/out-of-window frames
-	if seqLess(seq, c.rcvNext) || seq-c.rcvNext >= arqRecvWnd {
+	if seqLess(seq, c.rcvNext) || seq-c.rcvNext >= uint32(arqRecvWnd) {
 		return
 	}
 	if _, dup := c.rcvBuf[seq]; dup {
@@ -435,7 +449,7 @@ func (c *arqConn) flush(idle int) {
 
 	// The window reopened after the application drained a backlog: tell the
 	// sender now instead of waiting for its next zero-window probe.
-	if c.lastWndSent < arqRecvWnd/4 && wnd >= arqRecvWnd/2 && len(c.acks) == 0 && c.rcvNext == c.lastAckSent {
+	if int(c.lastWndSent) < arqRecvWnd/4 && int(wnd) >= arqRecvWnd/2 && len(c.acks) == 0 && c.rcvNext == c.lastAckSent {
 		c.emit(arqAck, 0, c.rcvNext, wnd, nil)
 	}
 	c.lastWndSent = wnd
