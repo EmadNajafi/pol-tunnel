@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,6 +16,7 @@ type Client struct {
 	cfg   *ClientConfig
 	dial  Dialer
 	stats *Stats
+	links atomic.Int32 // live links to the server: mux sessions, or 1 for the control channel
 }
 
 func NewClient(cfg *ClientConfig) *Client {
@@ -23,7 +25,9 @@ func NewClient(cfg *ClientConfig) *Client {
 
 func (c *Client) Run() error {
 	c.stats.Info = func() map[string]any {
-		return map[string]any{"transport": c.cfg.Transport, "remote": c.cfg.RemoteAddr}
+		n := c.links.Load()
+		return map[string]any{"transport": c.cfg.Transport, "remote": c.cfg.RemoteAddr,
+			"server_connected": n > 0, "links": n}
 	}
 	c.stats.Serve(c.cfg.WebPort)
 	if isMux(c.cfg.Transport) {
@@ -61,6 +65,7 @@ func (c *Client) muxLoop(i int) {
 		}
 		sess := NewSession(conn, c.cfg.MuxFrameSize, c.cfg.MuxWindow, c.cfg.Heartbeat)
 		logf("info", "mux #%d connected to %s", i, conn.RemoteAddr())
+		c.links.Add(1)
 		for {
 			st, err := sess.Accept()
 			if err != nil {
@@ -69,6 +74,7 @@ func (c *Client) muxLoop(i int) {
 			go c.handle(st, st.openProto, st.openAddr, st.openSrc)
 		}
 		sess.Close()
+		c.links.Add(-1)
 		logf("warn", "mux #%d disconnected", i)
 		time.Sleep(c.cfg.RetryInterval)
 	}
@@ -95,6 +101,7 @@ func (c *Client) controlLoop() {
 			}
 		}
 		logf("info", "connected to %s (pool=%d, heartbeat=%v)", ctl.RemoteAddr(), c.cfg.ConnectionPool, hb)
+		c.links.Add(1)
 
 		for i := 0; i < c.cfg.ConnectionPool; i++ {
 			go c.dataWorker(ctx, hb, true)
@@ -126,6 +133,7 @@ func (c *Client) controlLoop() {
 		}
 		cancel()
 		ctl.Close()
+		c.links.Add(-1)
 		logf("warn", "control channel lost, reconnecting in %v", c.cfg.RetryInterval)
 		time.Sleep(c.cfg.RetryInterval)
 	}

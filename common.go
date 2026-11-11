@@ -144,7 +144,14 @@ func (s *Stats) Serve(port int) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
-		body := map[string]any{"uptime_sec": int(time.Since(s.start).Seconds()), "ports": s.snapshot()}
+		ports := s.snapshot()
+		var in, out, active int64
+		for _, p := range ports {
+			in, out, active = in+p.BytesIn, out+p.BytesOut, active+p.Active
+		}
+		// totals too, so a status line needs no JSON arithmetic
+		body := map[string]any{"uptime_sec": int(time.Since(s.start).Seconds()), "ports": ports,
+			"bytes_in": in, "bytes_out": out, "active": active}
 		if s.Info != nil {
 			for k, v := range s.Info() {
 				body[k] = v
