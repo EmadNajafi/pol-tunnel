@@ -322,6 +322,10 @@ func (s *Server) listenTCP(pm PortMap) error {
 	return nil
 }
 
+// maxUDPPeers bounds the visitors one forwarded UDP port tracks at a time
+// (each holds a tunnel stream, a queue and two goroutines until it goes idle).
+const maxUDPPeers = 4096
+
 type udpPeer struct {
 	stream io.ReadWriteCloser
 	out    chan []byte
@@ -369,6 +373,12 @@ func (s *Server) listenUDP(pm PortMap) error {
 			key := addr.String()
 			mu.Lock()
 			p := peers[key]
+			if p == nil && len(peers) >= maxUDPPeers {
+				// a flood of datagrams from made-up sources must not grow state without bound
+				mu.Unlock()
+				logf("debug", "udp %s: %d peers already, dropping a new one", pm.Listen, maxUDPPeers)
+				continue
+			}
 			if p == nil {
 				t, err := s.open(protoUDP, pm.Target, key)
 				if err != nil {

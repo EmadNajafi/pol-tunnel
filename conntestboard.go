@@ -175,12 +175,18 @@ func ctBestTable(b *ctBest) string {
 	} else {
 		row("transport", "-", "nothing carried traffic steadily")
 	}
-	if b.MuxWindowKB > 0 {
-		row("mux_window", fmt.Sprint(b.MuxWindowKB*1024), fmt.Sprintf("%d KB in flight (speed × round trip)", b.BDPKB))
-	} else if b.Down > 0 || b.Up > 0 {
-		row("mux_window", "524288 (default)", "round trip too short to need more")
-	} else {
-		row("mux_window", "524288 (default)", "no speed measured")
+	// one profile instead of a raw window: the smallest whose per-stream mux
+	// window covers what the path needs (throughput is never suggested here —
+	// it trades latency for bulk speed, which is the operator's call)
+	switch {
+	case b.MuxWindowKB > 2048:
+		row("performance", `"aggressive"`, fmt.Sprintf("%d KB in flight (speed × round trip); uses more RAM", b.BDPKB))
+	case b.MuxWindowKB > 512:
+		row("performance", `"turbo"`, fmt.Sprintf("%d KB in flight (speed × round trip)", b.BDPKB))
+	case b.Down > 0 || b.Up > 0:
+		row("performance", `"balance"`, "round trip too short to need larger windows")
+	default:
+		row("performance", `"balance"`, "no speed measured")
 	}
 	row("heartbeat", fmt.Sprint(b.Heartbeat), fmt.Sprintf("worst round trip %dms ±%dms", b.WorstMs, b.JitterMs))
 	row("keepalive_period", fmt.Sprint(b.KeepaliveSeconds), fmt.Sprintf("%.1f%% loss", b.LossPct))

@@ -84,6 +84,9 @@ func main() {
 		go func() { errc <- NewClient(cfg.Client).Run() }()
 	}
 	if cfg.Direct != nil {
+		if cfg.Server == nil && cfg.Client == nil {
+			setLogLevel(cfg.Direct.LogLevel)
+		}
 		go func() { errc <- RunDirect(cfg.Direct) }()
 	}
 	if err := <-errc; err != nil {
