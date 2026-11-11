@@ -75,16 +75,16 @@ func perfFor(name string) (perfProfile, error) {
 	return p, nil
 }
 
-// applyARQProfile sets the process-wide ARQ tuning for the spoof transports.
-// Call it once at startup, before any tunnel conn exists.
+// applyARQProfile sets the ARQ tuning new spoof conns are created with.
+// Called once at startup; conns that already exist keep the tuning they have.
 func applyARQProfile(name string) {
 	p, err := perfFor(name)
 	if err != nil {
 		return // LoadConfig already rejected unknown names
 	}
-	arqRecvWnd, arqSendCap = p.ARQWindow, p.ARQWindow
-	arqInitCwnd, cwndFloor, fastResend = p.ARQInitCwnd, p.ARQFloor, p.ARQFastRes
-	minRTO, arqInterval, arqDelayAck = p.ARQMinRTO, p.ARQInterval, p.ARQDelayAck
+	arqTuning.Store(&arqTune{recvWnd: p.ARQWindow, sendCap: p.ARQWindow, initCwnd: p.ARQInitCwnd,
+		cwndFloor: p.ARQFloor, fastResend: p.ARQFastRes, minRTO: p.ARQMinRTO, interval: p.ARQInterval,
+		delayAck: p.ARQDelayAck})
 	if name != "" {
 		logf("info", "performance profile: %s", strings.ToLower(name))
 	}

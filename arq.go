@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,23 +40,32 @@ const (
 	idleKeepTk = 50 // ticks (×interval) of idleness before a keepalive PING
 )
 
-// ARQ tuning. These are the "balance" values; a performance profile replaces
-// them once at startup, before any conn exists (see performance.go). Each side
-// tunes itself: the window is advertised on the wire, so the two ends need not
-// match.
-var (
-	arqRecvWnd  = 1024 // advertised receive window (segments, at most 65535)
-	arqSendCap  = 1024 // max unacked+queued segments before Write blocks
-	arqInitCwnd = 32   // congestion window a new conn starts with (segments)
-	cwndFloor   = 8    // keep throughput on genuinely lossy links (KCP-style, gentle)
-	fastResend  = 3    // duplicate acks before a fast retransmit
-	minRTO      = 50 * time.Millisecond
-	arqInterval = 10 * time.Millisecond
-	// arqDelayAck batches acks on the tick instead of sending one per packet
-	// the moment it arrives: fewer packets and less CPU, slightly slower loss
-	// recovery (the bulk-transfer profile).
-	arqDelayAck = false
-)
+// arqTune is the ARQ tuning. A conn takes the current one when it is created
+// and keeps it for life, so a profile change never touches a running conn.
+// Each side tunes itself: the window is advertised on the wire, so the two
+// ends need not match.
+type arqTune struct {
+	recvWnd    int // advertised receive window (segments, at most 65535)
+	sendCap    int // max unacked+queued segments before Write blocks
+	initCwnd   int // congestion window a new conn starts with (segments)
+	cwndFloor  int // keep throughput on genuinely lossy links (KCP-style, gentle)
+	fastResend int // duplicate acks before a fast retransmit
+	minRTO     time.Duration
+	interval   time.Duration // flush tick
+	// delayAck batches acks on the tick instead of sending one per packet
+	// the moment it arrives: fewer packets and less CPU, slightly slower
+	// loss recovery (the bulk-transfer profile).
+	delayAck bool
+}
+
+// arqTuning is what new conns use: the "balance" values until a performance
+// profile replaces them at startup (see performance.go).
+var arqTuning atomic.Pointer[arqTune]
+
+func init() {
+	arqTuning.Store(&arqTune{recvWnd: 1024, sendCap: 1024, initCwnd: 32, cwndFloor: 8, fastResend: 3,
+		minRTO: 50 * time.Millisecond, interval: 10 * time.Millisecond})
+}
 
 type seg struct {
 	seq     uint32
@@ -70,6 +80,7 @@ type seg struct {
 }
 
 type arqConn struct {
+	t      *arqTune // tuning, fixed when the conn is created
 	send   func([]byte) error
 	local  net.Addr
 	remote net.Addr
@@ -110,12 +121,14 @@ type arqConn struct {
 }
 
 func newARQ(send func([]byte) error, local, remote net.Addr) *arqConn {
+	t := arqTuning.Load()
 	c := &arqConn{
+		t:    t,
 		send: send, local: local, remote: remote,
 		wk:          make(chan struct{}, 1),
-		rmtWnd:      uint32(arqRecvWnd),
-		lastWndSent: uint16(arqRecvWnd),
-		cwnd:        arqInitCwnd,
+		rmtWnd:      uint32(t.recvWnd),
+		lastWndSent: uint16(t.recvWnd),
+		cwnd:        t.initCwnd,
 		ssthresh:    1 << 20,
 		rcvBuf:      map[uint32]*seg{},
 	}
@@ -130,11 +143,11 @@ func seqLess(a, b uint32) bool { return int32(a-b) < 0 }
 
 func (c *arqConn) rto() time.Duration {
 	if c.srtt == 0 {
-		return 2 * minRTO
+		return 2 * c.t.minRTO
 	}
 	rto := c.srtt + 4*c.rttvar
-	if rto < minRTO {
-		rto = minRTO
+	if rto < c.t.minRTO {
+		rto = c.t.minRTO
 	}
 	if rto > maxRTO {
 		rto = maxRTO
@@ -196,7 +209,7 @@ func (c *arqConn) input(data []byte) {
 			woke = true
 		case arqPush:
 			c.onPush(seqn, flags, payload)
-			if !arqDelayAck { // batched acks go out on the next tick instead
+			if !c.t.delayAck { // batched acks go out on the next tick instead
 				woke = true
 			}
 		case arqPing:
@@ -261,8 +274,8 @@ func (c *arqConn) grow(acked int) {
 			}
 		}
 	}
-	if c.cwnd > arqSendCap {
-		c.cwnd = arqSendCap
+	if c.cwnd > c.t.sendCap {
+		c.cwnd = c.t.sendCap
 	}
 }
 
@@ -276,8 +289,8 @@ func (c *arqConn) backoff(timeout bool) {
 	} else {
 		c.cwnd = c.cwnd * 3 / 4
 	}
-	if c.cwnd < cwndFloor {
-		c.cwnd = cwndFloor
+	if c.cwnd < c.t.cwndFloor {
+		c.cwnd = c.t.cwndFloor
 	}
 	c.ssthresh = c.cwnd
 	c.ackAcc = 0
@@ -285,7 +298,7 @@ func (c *arqConn) backoff(timeout bool) {
 
 func (c *arqConn) onPush(seq uint32, flags byte, payload []byte) {
 	c.acks = append(c.acks, seq) // ack even duplicates/out-of-window frames
-	if seqLess(seq, c.rcvNext) || seq-c.rcvNext >= uint32(arqRecvWnd) {
+	if seqLess(seq, c.rcvNext) || seq-c.rcvNext >= uint32(c.t.recvWnd) {
 		return
 	}
 	if _, dup := c.rcvBuf[seq]; dup {
@@ -353,8 +366,8 @@ func (c *arqConn) sendWindow() int {
 	if int(c.rmtWnd) < w {
 		w = int(c.rmtWnd)
 	}
-	if w > arqSendCap {
-		w = arqSendCap
+	if w > c.t.sendCap {
+		w = c.t.sendCap
 	}
 	if w < 1 {
 		w = 1 // let a zero window probe so it can recover
@@ -370,7 +383,7 @@ func (c *arqConn) Write(p []byte) (int, error) {
 	}
 	total := len(p)
 	for len(p) > 0 {
-		for c.pending() >= arqSendCap {
+		for c.pending() >= c.t.sendCap {
 			if c.closed {
 				return total - len(p), c.closeErr
 			}
@@ -411,7 +424,7 @@ func (c *arqConn) CloseWrite() error {
 // ---- periodic flush ----
 
 func (c *arqConn) updater() {
-	t := time.NewTicker(arqInterval)
+	t := time.NewTicker(c.t.interval)
 	defer t.Stop()
 	idle := 0
 	for {
@@ -436,7 +449,7 @@ func (c *arqConn) updater() {
 // fast sender and a slow reader (e.g. a download to a slow visitor) would grow
 // rStream without bound, since the window would never shrink.
 func (c *arqConn) recvWindow() uint16 {
-	free := arqRecvWnd - len(c.rcvBuf) - (len(c.rStream)+arqMTU-1)/arqMTU
+	free := c.t.recvWnd - len(c.rcvBuf) - (len(c.rStream)+arqMTU-1)/arqMTU
 	if free < 0 {
 		free = 0
 	}
@@ -449,7 +462,7 @@ func (c *arqConn) flush(idle int) {
 
 	// The window reopened after the application drained a backlog: tell the
 	// sender now instead of waiting for its next zero-window probe.
-	if int(c.lastWndSent) < arqRecvWnd/4 && int(wnd) >= arqRecvWnd/2 && len(c.acks) == 0 && c.rcvNext == c.lastAckSent {
+	if int(c.lastWndSent) < c.t.recvWnd/4 && int(wnd) >= c.t.recvWnd/2 && len(c.acks) == 0 && c.rcvNext == c.lastAckSent {
 		c.emit(arqAck, 0, c.rcvNext, wnd, nil)
 	}
 	c.lastWndSent = wnd
@@ -488,7 +501,7 @@ func (c *arqConn) flush(idle int) {
 			if s.rto > 2*time.Second { // cap so a persistently-lost segment retries promptly
 				s.rto = 2 * time.Second
 			}
-		case s.fastHits >= fastResend:
+		case s.fastHits >= c.t.fastResend:
 			resend = true
 			fastLoss = true
 			s.fastHits = 0
@@ -559,7 +572,7 @@ func (c *arqConn) Close() error {
 func (c *arqConn) emitRST() {
 	b := make([]byte, arqHeader)
 	b[0] = arqRST
-	binary.BigEndian.PutUint16(b[2:], uint16(arqRecvWnd))
+	binary.BigEndian.PutUint16(b[2:], uint16(c.t.recvWnd))
 	binary.BigEndian.PutUint32(b[8:], c.rcvNext)
 	c.send(b) // ignore errors: the conn is going away
 }
