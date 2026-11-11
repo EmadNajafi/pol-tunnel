@@ -39,7 +39,7 @@ const (
 var (
 	directMTUInterval  = 30 * time.Minute
 	directProbeTimeout = time.Second
-	directProbeTries   = 2
+	directProbeTries   = 3
 )
 
 func (e *directEngine) handleControl(plain []byte, path int) {
@@ -138,6 +138,14 @@ func (e *directEngine) autoMTULoop() {
 			time.Sleep(time.Second)
 		}
 		best := e.measureMTU()
+		if best != 0 && best-directOverhead < e.currentMTU() {
+			// A lower result may only be lost probes (every size is tried a few
+			// times, but a lossy route can still lose them all): measure again
+			// and keep the larger, so loss does not shrink the MTU for no reason.
+			if again := e.measureMTU(); again > best {
+				best = again
+			}
+		}
 		if best == 0 {
 			logf("warn", "direct: auto MTU: the peer did not answer probes (older pol on the other side?); keeping mtu %d", e.currentMTU())
 		} else if mtu := best - directOverhead; mtu != e.currentMTU() {

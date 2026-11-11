@@ -13,6 +13,9 @@
 # Manages one or more tunnels, each as a systemd service pol-<name>.service with
 # its config at /etc/pol/<name>.toml. Needs root (Linux).
 set -euo pipefail
+# Files this script creates hold tunnel tokens: private from the moment they
+# exist (binaries and unit files get their modes set explicitly below).
+umask 077
 
 REPO="EmadNajafi/pol-tunnel"
 BIN="/usr/local/bin/pol"
@@ -114,6 +117,47 @@ do_install() {
   mkdir -p "$CFGDIR"
   install_menu "$base" "$sums"
   rm -f "$sums"
+  restart_stale_tunnels
+}
+
+# stale_tunnels prints the tunnels whose running process still executes a pol
+# binary that has since been replaced (the kernel marks its exe "(deleted)").
+# An update swaps the file but a running service keeps the old code until it
+# is restarted.
+stale_tunnels() {
+  local n pid
+  for n in $(list_names); do
+    pid="$(systemctl show -p MainPID --value "pol-$n.service" 2>/dev/null || true)"
+    [ -n "$pid" ] && [ "$pid" != 0 ] || continue
+    case "$(readlink "/proc/$pid/exe" 2>/dev/null || true)" in
+      *"(deleted)") printf '%s\n' "$n" ;;
+    esac
+  done
+}
+
+# restart_stale_tunnels restarts tunnels still running an old binary. On a
+# terminal it asks first (a restart drops the tunnel's connections for a
+# moment); the non-interactive `update` just does it.
+restart_stale_tunnels() {
+  local stale n
+  stale="$(stale_tunnels | tr '\n' ' ')"
+  [ -n "${stale// /}" ] || return 0
+  warn "still running the previous pol version: $stale"
+  if [ -t 0 ] && ! ask_yn "restart them now to use $("$BIN" -version 2>/dev/null)? [Y/n]:" y; then
+    warn "not restarted — they keep the old version until you restart them (menu option 3)"
+    return 0
+  fi
+  for n in $stale; do
+    if systemctl restart "pol-$n.service" >/dev/null 2>&1; then ok "restarted tunnel '$n'"; else warn "could not restart tunnel '$n'"; fi
+  done
+}
+
+# next_web_port prints the first status-panel port from 2060 up that no
+# existing tunnel config uses, so two tunnels on one server do not clash.
+next_web_port() {
+  local p=2060
+  while grep -qsE "^web_port *= *$p\$" "$CFGDIR"/*.toml 2>/dev/null; do p=$((p + 1)); done
+  printf '%s' "$p"
 }
 
 # install_menu installs this manager as the `poltunnel` command. It tries the
@@ -180,6 +224,7 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+  chmod 644 "/etc/systemd/system/pol-$name.service"
   systemctl daemon-reload
   # forget a failed state left by an earlier tunnel of the same name
   systemctl reset-failed "pol-$name.service" >/dev/null 2>&1 || true
@@ -273,7 +318,7 @@ do_create() {
         echo "encryption = $enc"
         echo "performance = \"$perf\""
         echo "heartbeat = 20"
-        echo "web_port = 2060"
+        echo "web_port = $(next_web_port)"
         echo "log_level = \"info\""
         printf 'ports = ['
         local first=1 p
@@ -310,11 +355,13 @@ do_create() {
         echo "proxy_protocol = $proxy"
         [ -n "$pool" ] && echo "connection_pool = $pool"
         echo "heartbeat = 20"
-        echo "web_port = 2061"
+        echo "web_port = $(next_web_port)"
         echo "log_level = \"info\""
       } > "$f"
       ;;
     3|4) # direct
+      # the interface is named pol-<name>, and Linux allows 15 characters
+      [ ${#name} -le 11 ] || { err "a direct tunnel's name can be at most 11 characters (it names the interface pol-$name)"; return 1; }
       local role=server; [ "$kind" = 4 ] && role=client
       read -rp "this side's tunnel IP [10.200.0.1]: " lip; lip=${lip:-10.200.0.1}
       read -rp "peer's tunnel IP [10.200.0.2]: " pip; pip=${pip:-10.200.0.2}

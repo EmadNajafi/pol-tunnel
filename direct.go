@@ -49,6 +49,7 @@ type DirectConfig struct {
 	SNIDomain   string // sni: the domain named in the decoy TLS ClientHello
 	Paths       int    // number of sockets on consecutive ports (multipath); 1 = single socket
 	AutoMTU     bool   // measure the route and set the interface MTU (needs a peer that answers probes)
+	LogLevel    string // debug, info (default), warn or error
 }
 
 const (

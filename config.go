@@ -326,7 +326,7 @@ var sectionKeys = map[string]map[string]string{
 	"direct": {"role": kStr, "bind_addr": kStr, "remote_addr": kStr, "token": kStr, "tun_name": kStr,
 		"local_ip": kStr, "peer_ip": kStr, "mtu": kInt, "carrier": kStr, "spoof_source": kStr,
 		"spoof_peer_ip": kStr, "sni_domain": kStr, "paths": kInt, "auto_mtu": kBool,
-		"log_level": kStr}, // written by the installer; accepted, not used
+		"log_level": kStr},
 }
 
 // checkTypes rejects a value of the wrong type and warns about a key it does
@@ -424,6 +424,7 @@ func LoadConfig(path string) (*Config, error) {
 			SNIDomain:   sec.str("sni_domain", ""),
 			Paths:       sec.num("paths", 1),
 			AutoMTU:     sec.boolean("auto_mtu", true),
+			LogLevel:    sec.str("log_level", "info"),
 		}
 		switch d.Carrier {
 		case "udp", "icmp", "pck":
