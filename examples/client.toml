@@ -5,6 +5,8 @@ remote_addr = "IRAN_IP:3080"
 transport = "tcpmux"          # must match the server
 token = "CHANGE_ME"
 encryption = true             # must match the server
+# performance = "turbo"       # balance (default) | turbo | aggressive | throughput (use the same on both ends);
+#                             # sets connection_pool / mux_* / nodelay unless they are written here
 # proxy_protocol = true       # send the real visitor IP to the backend (PROXY v2)
 connection_pool = 8           # idle data conns (tcp/ws) or mux sessions (*mux)
 retry_interval = 3

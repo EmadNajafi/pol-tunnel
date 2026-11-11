@@ -35,7 +35,8 @@ type Common struct {
 	ChannelSize  int
 	DialTimeout  time.Duration
 	UDPIdle      time.Duration
-	Encryption   bool // wrap the transport in AES-256-GCM after an X25519 handshake
+	Encryption   bool   // wrap the transport in AES-256-GCM after an X25519 handshake
+	Performance  string // balance (default), turbo, aggressive or throughput: see performance.go
 }
 
 type ServerConfig struct {
@@ -252,6 +253,11 @@ func (s section) secs(k string, d time.Duration) time.Duration {
 
 func loadCommon(s section) Common {
 	c := defaultCommon()
+	// the performance profile sets the starting values; explicit keys below win
+	c.Performance = strings.ToLower(s.str("performance", ""))
+	if p, err := perfFor(c.Performance); err == nil {
+		c.MuxWindow, c.MuxFrameSize, c.Nodelay, c.ChannelSize = p.MuxWindow, p.MuxFrameSize, p.Nodelay, p.ChannelSize
+	}
 	c.Transport = strings.ToLower(s.str("transport", c.Transport))
 	c.Token = s.str("token", "")
 	c.Keepalive = s.secs("keepalive_period", c.Keepalive)
@@ -310,7 +316,7 @@ var commonKeys = map[string]string{
 	"transport": kStr, "token": kStr, "keepalive_period": kInt, "nodelay": kBool, "heartbeat": kInt,
 	"mux_framesize": kInt, "mux_window": kInt, "web_port": kInt, "log_level": kStr, "path": kStr,
 	"tls_cert": kStr, "tls_key": kStr, "tls_sni": kStr, "tls_insecure": kBool, "channel_size": kInt,
-	"dial_timeout": kInt, "udp_idle_timeout": kInt, "encryption": kBool,
+	"dial_timeout": kInt, "udp_idle_timeout": kInt, "encryption": kBool, "performance": kStr,
 }
 
 var sectionKeys = map[string]map[string]string{
@@ -386,7 +392,11 @@ func LoadConfig(path string) (*Config, error) {
 		cc.EdgeIP = sec.str("edge_ip", "")
 		cc.SpoofSource = sec.str("spoof_source", "")
 		cc.ProxyProtocol = sec.boolean("proxy_protocol", false)
-		cc.ConnectionPool = sec.num("connection_pool", 8)
+		pool := 8
+		if p, err := perfFor(cc.Performance); err == nil {
+			pool = p.Pool
+		}
+		cc.ConnectionPool = sec.num("connection_pool", pool)
 		cc.RetryInterval = sec.secs("retry_interval", 3*time.Second)
 		if cc.ConnectionPool < 1 {
 			cc.ConnectionPool = 1
@@ -481,6 +491,9 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		if !validTransport(c.Transport) {
 			return nil, fmt.Errorf("unknown transport %q", c.Transport)
+		}
+		if _, err := perfFor(c.Performance); err != nil {
+			return nil, err
 		}
 	}
 	return cfg, nil

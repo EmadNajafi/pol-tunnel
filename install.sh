@@ -181,13 +181,49 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
+  # forget a failed state left by an earlier tunnel of the same name
+  systemctl reset-failed "pol-$name.service" >/dev/null 2>&1 || true
   if ! systemctl enable --now "pol-$name.service" >/dev/null 2>&1; then
     err "service pol-$name failed to start — see: journalctl -u pol-$name -n 30"
     return 1
   fi
+  # `enable --now` succeeds even when pol exits right away (bad config, port
+  # already in use): look again after a moment and show why
+  sleep 1.5
+  if [ "$(systemctl is-active "pol-$name.service" 2>/dev/null || true)" != active ]; then
+    err "pol-$name started and stopped again:"
+    journalctl -u "pol-$name.service" --no-pager -n 5 -o cat 2>/dev/null | sed 's/^/    /' >&2 || true
+    return 1
+  fi
+}
+
+# remove_tunnel deletes a tunnel's service, config and any leftovers, so the
+# same name can be created again cleanly.
+remove_tunnel() {
+  local n=$1
+  systemctl disable --now "pol-$n.service" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/pol-$n.service" "$CFGDIR/$n.toml"
+  systemctl daemon-reload
+  systemctl reset-failed "pol-$n.service" >/dev/null 2>&1 || true
+  # a direct tunnel's interface, if its process was killed before it could remove it
+  if ip link show "pol-$n" >/dev/null 2>&1; then ip link del "pol-$n" >/dev/null 2>&1 || true; fi
 }
 
 valid_name() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
+
+# ---------- performance profile picker (prints the chosen profile on stdout) ----------
+pick_performance() {
+  local c
+  {
+  say "performance profile (use the same one on both servers):"
+  say "  1) balance     light on CPU and RAM — small or shared server"
+  say "  2) turbo       larger windows, quicker recovery (default, recommended)"
+  say "  3) aggressive  pushes hardest, also through loss — more RAM and CPU"
+  say "  4) throughput  bulk transfer (downloads/uploads) — not for games"
+  read -rp "performance [2]: " c
+  } >&2
+  case "${c:-2}" in 1) echo balance;; 3) echo aggressive;; 4) echo throughput;; *) echo turbo;; esac
+}
 
 # ask_yn "prompt" <default y|n> -> returns 0 (yes) / 1 (no)
 ask_yn() {
@@ -215,9 +251,10 @@ do_create() {
   local f="$CFGDIR/$name.toml" token
   case "$kind" in
     1) # reverse server
-      local tr bind enc
+      local tr bind enc perf
       tr=$(pick_transport)
       read -rp "tunnel bind port [3080]: " bind; bind=${bind:-3080}
+      perf=$(pick_performance)
       enc=$(ask_yn "encrypt the tunnel (AES-256-GCM)? [Y/n]:" y && echo true || echo false)
       token="$(gen_token)"
       say "generated token (put the SAME token on the client):"
@@ -234,6 +271,7 @@ do_create() {
         echo "transport = \"$tr\""
         echo "token = \"$token\""
         echo "encryption = $enc"
+        echo "performance = \"$perf\""
         echo "heartbeat = 20"
         echo "web_port = 2060"
         echo "log_level = \"info\""
@@ -244,11 +282,13 @@ do_create() {
       } > "$f"
       ;;
     2) # reverse client
-      local tr remote pool enc proxy
+      local tr remote pool enc proxy perf
       tr=$(pick_transport)
       read -rp "server address (IRAN_IP:PORT): " remote
       read -rp "token (from the server): " token
-      read -rp "connection_pool [8]: " pool; pool=${pool:-8}
+      perf=$(pick_performance)
+      read -rp "connection_pool [from the profile]: " pool
+      [ -z "$pool" ] || [[ "$pool" =~ ^[0-9]+$ ]] || { err "connection_pool must be a number"; return 1; }
       enc=$(ask_yn "encrypt the tunnel (must match the server)? [Y/n]:" y && echo true || echo false)
       proxy=$(ask_yn "send PROXY protocol v2 to the backend (real client IP)? [y/N]:" n && echo true || echo false)
       say "backup server addresses (optional, one per line, empty to finish):"
@@ -266,8 +306,9 @@ do_create() {
         echo "transport = \"$tr\""
         echo "token = \"$token\""
         echo "encryption = $enc"
+        echo "performance = \"$perf\""
         echo "proxy_protocol = $proxy"
-        echo "connection_pool = $pool"
+        [ -n "$pool" ] && echo "connection_pool = $pool"
         echo "heartbeat = 20"
         echo "web_port = 2061"
         echo "log_level = \"info\""
@@ -340,7 +381,12 @@ do_create() {
   esac
 
   chmod 600 "$f"
-  write_service "$name" || return 1
+  if ! write_service "$name"; then
+    # leave nothing behind, so the same name can be used again after the fix
+    remove_tunnel "$name"
+    err "tunnel '$name' was not created (nothing was left behind) — fix the cause above and create it again"
+    return 1
+  fi
   ok "tunnel '$name' created and started"
   sleep 1
   systemctl --no-pager -l status "pol-$name.service" | sed -n '1,6p' || true
@@ -390,10 +436,33 @@ do_logs() { local n; n=$(pick_tunnel) || return; journalctl -u "pol-$n" --no-pag
 
 do_delete() {
   local n; n=$(pick_tunnel) || return
-  systemctl disable --now "pol-$n.service" >/dev/null 2>&1 || true
-  rm -f "/etc/systemd/system/pol-$n.service" "$CFGDIR/$n.toml"
-  systemctl daemon-reload
+  remove_tunnel "$n"
   ok "tunnel '$n' deleted"
+}
+
+# change the performance profile of an existing reverse tunnel
+do_performance() {
+  local n f cur perf over
+  n=$(pick_tunnel) || return
+  f="$CFGDIR/$n.toml"
+  if grep -q '^\[direct\]' "$f"; then
+    warn "'$n' is a direct (L3) tunnel — performance profiles apply to reverse tunnels only"
+    return 0
+  fi
+  cur="$(sed -n 's/^performance *= *"\(.*\)".*/\1/p' "$f" | head -1)"
+  say "tunnel '$n' — current profile: ${C_CYN}${cur:-balance (not set)}${C_RESET}"
+  perf=$(pick_performance)
+  if grep -q '^performance *=' "$f"; then
+    sed -i "s/^performance *=.*/performance = \"$perf\"/" "$f"
+  else
+    sed -i "0,/^transport *=/s//performance = \"$perf\"\n&/" "$f"
+    grep -q '^performance *=' "$f" || echo "performance = \"$perf\"" >> "$f"
+  fi
+  # keys written in the config win over the profile: say so instead of surprising
+  over="$(grep -oE '^(connection_pool|mux_window|mux_framesize|nodelay|channel_size)' "$f" | tr '\n' ' ' || true)"
+  [ -n "$over" ] && warn "these keys in $f override the profile: $over(delete a line to use the profile's value)"
+  systemctl restart "pol-$n.service"
+  ok "tunnel '$n' now uses the '$perf' profile (restarted) — set the same on the other server"
 }
 
 # tunnel test between two servers
@@ -468,6 +537,7 @@ menu() {
     say "  6) Connection Test — which tunnels work between two servers"
     say "  7) Link Test — latency / jitter / loss + a recommendation"
     say "  8) Uninstall everything"
+    say "  9) Performance profile of a tunnel — balance / turbo / aggressive / throughput"
     say "  0) Exit"
     [ -x "$MGR" ] && say "${C_DIM}  (reopen this menu any time with:  poltunnel)${C_RESET}"
     local c; read -rp $'\nchoice: ' c || { echo; exit 0; } # exit cleanly on EOF (non-interactive)
@@ -482,6 +552,7 @@ menu() {
       6) run_action do_conntest;;
       7) run_action do_linktest;;
       8) run_action do_uninstall;;
+      9) run_action do_performance;;
       0|q) exit 0;;
       *) ;;
     esac

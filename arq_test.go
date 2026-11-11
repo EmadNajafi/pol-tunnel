@@ -213,7 +213,7 @@ func TestARQSlowReaderBounded(t *testing.T) {
 	l.b.mu.Lock()
 	backlog := len(l.b.rStream)
 	l.b.mu.Unlock()
-	if limit := 2 * arqRecvWnd * arqMTU; backlog > limit {
+	if limit := 2 * l.b.t.recvWnd * arqMTU; backlog > limit {
 		t.Fatalf("unread backlog %d bytes exceeds %d: receive window ignores unread data", backlog, limit)
 	}
 
