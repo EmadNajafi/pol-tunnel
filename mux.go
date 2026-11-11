@@ -159,7 +159,12 @@ func (s *Session) keepalive(every time.Duration) {
 				s.Close()
 				return
 			}
-			s.writeFrame(cmdPING, 0, nil)
+			// Never ping from this goroutine: with the path blackholed and
+			// data in flight, a writer sits in conn.Write holding the write
+			// lock, the ping would queue behind it, and the silence check
+			// above would never run again — the session then hung until TCP
+			// itself gave up, many minutes later.
+			go s.writeFrame(cmdPING, 0, nil)
 		}
 	}
 }

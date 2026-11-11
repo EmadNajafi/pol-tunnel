@@ -294,9 +294,73 @@ func loadCommon(s section) Common {
 	return c
 }
 
+// ---- key / type check ----
+
+// What each key must be. The typed accessors fall back to the default when a
+// value has another type, so without this check `encryption = "true"` (a
+// string) silently left the tunnel unencrypted.
+const (
+	kStr  = "a quoted string"
+	kInt  = "a number"
+	kBool = "true or false"
+	kArr  = "a list of strings"
+)
+
+var commonKeys = map[string]string{
+	"transport": kStr, "token": kStr, "keepalive_period": kInt, "nodelay": kBool, "heartbeat": kInt,
+	"mux_framesize": kInt, "mux_window": kInt, "web_port": kInt, "log_level": kStr, "path": kStr,
+	"tls_cert": kStr, "tls_key": kStr, "tls_sni": kStr, "tls_insecure": kBool, "channel_size": kInt,
+	"dial_timeout": kInt, "udp_idle_timeout": kInt, "encryption": kBool,
+}
+
+var sectionKeys = map[string]map[string]string{
+	"server": {"bind_addr": kStr, "accept_udp": kBool, "peer_addr": kStr, "spoof_source": kStr, "ports": kArr},
+	"client": {"remote_addr": kStr, "remote_addrs": kArr, "edge_ip": kStr, "spoof_source": kStr,
+		"proxy_protocol": kBool, "connection_pool": kInt, "retry_interval": kInt},
+	"direct": {"role": kStr, "bind_addr": kStr, "remote_addr": kStr, "token": kStr, "tun_name": kStr,
+		"local_ip": kStr, "peer_ip": kStr, "mtu": kInt, "carrier": kStr, "spoof_source": kStr,
+		"spoof_peer_ip": kStr, "sni_domain": kStr, "paths": kInt, "auto_mtu": kBool,
+		"log_level": kStr}, // written by the installer; accepted, not used
+}
+
+// checkTypes rejects a value of the wrong type and warns about a key it does
+// not know (a typo would otherwise be ignored without a word).
+func checkTypes(t tomlTable) error {
+	for name, keys := range sectionKeys {
+		for k, v := range t[name] {
+			want, ok := keys[k]
+			if !ok && name != "direct" {
+				want, ok = commonKeys[k]
+			}
+			if !ok {
+				logf("warn", "config: unknown key %q in [%s] is ignored (typo?)", k, name)
+				continue
+			}
+			var good bool
+			switch v.(type) {
+			case string:
+				good = want == kStr
+			case int64:
+				good = want == kInt
+			case bool:
+				good = want == kBool
+			case []string:
+				good = want == kArr
+			}
+			if !good {
+				return fmt.Errorf("[%s] %s must be %s", name, k, want)
+			}
+		}
+	}
+	return nil
+}
+
 func LoadConfig(path string) (*Config, error) {
 	t, err := parseTOML(path)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkTypes(t); err != nil {
 		return nil, err
 	}
 	cfg := &Config{}
