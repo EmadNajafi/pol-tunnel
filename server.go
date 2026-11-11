@@ -128,6 +128,11 @@ func (s *Server) runControl(c net.Conn) {
 	s.ctl = c
 	s.ctlMu.Unlock()
 	logf("info", "client connected from %s", c.RemoteAddr())
+	// Pooled conns still here belong to the previous client instance and are
+	// dead on its side; visitors handed one would fail. The new client only
+	// dials its data conns after it reads the config message below, so
+	// nothing of its own can be in the pool yet.
+	s.drainPool()
 
 	hb := s.cfg.Heartbeat
 	cfgMsg := []byte{ctlConfig, 0, 0}
@@ -160,11 +165,27 @@ func (s *Server) runControl(c net.Conn) {
 	close(done)
 	c.Close()
 	s.ctlMu.Lock()
-	if s.ctl == c {
+	current := s.ctl == c
+	if current {
 		s.ctl = nil
 	}
 	s.ctlMu.Unlock()
+	if current {
+		s.drainPool() // the client is gone (not replaced): so are its data conns
+	}
 	logf("warn", "control channel from %s lost", c.RemoteAddr())
+}
+
+// drainPool closes every idle pooled data conn.
+func (s *Server) drainPool() {
+	for {
+		select {
+		case c := <-s.pool:
+			c.Close()
+		default:
+			return
+		}
+	}
 }
 
 func (s *Server) ctlWrite(c net.Conn, b []byte) error {
