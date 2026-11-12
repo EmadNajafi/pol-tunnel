@@ -56,6 +56,9 @@ func openRawIO(proto byte) (*rawIO, error) {
 		syscall.Close(sendFd)
 		return nil, fmt.Errorf("raw recv socket: %w", err)
 	}
+	// a raw socket sees every packet of its protocol on the host: give it room
+	forceSockBuf(recvFd, 8<<20)
+	forceSockBuf(sendFd, 8<<20)
 	return &rawIO{sendFd: sendFd, recvFd: recvFd, proto: proto, srcIP: map[string]net.IP{}}, nil
 }
 

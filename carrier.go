@@ -57,8 +57,7 @@ func (u *udpIO) setDF(on bool) {
 func udpPaths(cfg *DirectConfig, socks []*net.UDPConn) ([]*directPath, error) {
 	var paths []*directPath
 	for i, s := range socks {
-		s.SetReadBuffer(4 << 20)
-		s.SetWriteBuffer(4 << 20)
+		bigBuffers(s, 8<<20)
 		io := &udpIO{conn: s, sender: plainSender{s}}
 		if cfg.Carrier == "spoof" {
 			snd, err := buildSender(s, cfg.SpoofSource, "")

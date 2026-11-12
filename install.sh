@@ -460,7 +460,7 @@ update_note() {
   tag="$(cat "$LATEST_CACHE" 2>/dev/null || true)"
   cur="$([ -x "$BIN" ] && "$BIN" -version 2>/dev/null | awk '{print $2}' || true)"
   if [ -n "$tag" ] && [ -n "$cur" ] && [ "v$cur" != "$tag" ]; then
-    printf '%s%s is available%s — choose %s5%s (Install / update)' "$C_YEL" "$tag" "$C_RESET" "$C_B" "$C_RESET"
+    printf '%s%s is available%s — choose %s4%s (Install / update)' "$C_YEL" "$tag" "$C_RESET" "$C_B" "$C_RESET"
   fi
 }
 
@@ -1027,25 +1027,6 @@ do_conntest() {
   esac
 }
 
-do_linktest() {
-  ensure_installed
-  local c
-  section "Link Test"
-  hint "Latency, jitter and loss over TCP and UDP, a forged-source check, and a recommendation."
-  echo
-  choose c 2 \
-    "listen|Listener|on the tunnel-host server (Iran) — run this first" \
-    "run|Run|on the other server (kharej) — measures and reports" || return 1
-  case "$c" in
-    listen)
-      local p; ask p "listen port" 7000 v_free_port || return 1
-      say "listening on :$p — run the test on the other server, then press Ctrl+C here"
-      "$BIN" -probe-listen ":$p" ;;
-    run)
-      local peer; ask peer "listener address (OTHER_SERVER_IP:7000)" "" v_hostport || return 1
-      "$BIN" -probe "$peer" ;;
-  esac
-}
 
 do_uninstall() {
   local n a count
@@ -1129,7 +1110,6 @@ draw_main() {
     "new|New tunnel|create a reverse or direct tunnel" \
     "manage|Manage a tunnel|restart, log, config, profile, join code, delete" \
     "conntest|Connection test|which kinds of tunnel work between the two servers" \
-    "linktest|Link test|latency, jitter and loss to the other server" \
     "update|Install / update|get the newest pol and this menu" \
     "uninstall|Uninstall|remove pol and every tunnel"
   printf '   %s 0)%s Exit\n' "$C_CYN" "$C_RESET"
@@ -1179,7 +1159,6 @@ menu() {
       new) run_action do_create ;;
       manage) manage_tunnel || true ;;
       conntest) run_action do_conntest ;;
-      linktest) run_action do_linktest ;;
       update) run_action do_install; rm -f "$LATEST_CACHE"; refresh_latest || true ;;
       uninstall) run_action do_uninstall ;;
       *) if [ -n "$c" ]; then err "choose a number from the list"; sleep 1; fi ;;
@@ -1230,7 +1209,7 @@ main() {
       if do_install; then
         NOTICE="${C_GRN}✓${C_RESET} up to date: $("$BIN" -version 2>/dev/null)"
       else
-        NOTICE="${C_YEL}!${C_RESET} automatic update failed (see above) — choose 5 to retry"
+        NOTICE="${C_YEL}!${C_RESET} automatic update failed (see above) — choose 4 to retry"
         pause || true
       fi
       ;;

@@ -24,7 +24,8 @@ type Common struct {
 	Nodelay      bool
 	Heartbeat    time.Duration
 	MuxFrameSize int
-	MuxWindow    int
+	MuxWindow    int // the receive window a mux stream starts with
+	MuxMaxWindow int // how far it may grow by itself while the window is the bottleneck
 	WebPort      int
 	LogLevel     string
 	Path         string // websocket path
@@ -77,6 +78,7 @@ func defaultCommon() Common {
 		Heartbeat:    20 * time.Second,
 		MuxFrameSize: 32 * 1024,
 		MuxWindow:    512 * 1024,
+		MuxMaxWindow: 4 * 1024 * 1024,
 		LogLevel:     "info",
 		Path:         "/ws",
 		TLSInsecure:  true,
@@ -257,6 +259,7 @@ func loadCommon(s section) Common {
 	c.Performance = strings.ToLower(s.str("performance", ""))
 	if p, err := perfFor(c.Performance); err == nil {
 		c.MuxWindow, c.MuxFrameSize, c.Nodelay, c.ChannelSize = p.MuxWindow, p.MuxFrameSize, p.Nodelay, p.ChannelSize
+		c.MuxMaxWindow = p.MuxMaxWindow
 	}
 	c.Transport = strings.ToLower(s.str("transport", c.Transport))
 	c.Token = s.str("token", "")
@@ -265,6 +268,7 @@ func loadCommon(s section) Common {
 	c.Heartbeat = s.secs("heartbeat", c.Heartbeat)
 	c.MuxFrameSize = s.num("mux_framesize", c.MuxFrameSize)
 	c.MuxWindow = s.num("mux_window", c.MuxWindow)
+	c.MuxMaxWindow = s.num("mux_max_window", c.MuxMaxWindow)
 	c.WebPort = s.num("web_port", 0)
 	c.LogLevel = s.str("log_level", c.LogLevel)
 	c.Path = s.str("path", c.Path)
@@ -281,6 +285,10 @@ func loadCommon(s section) Common {
 	}
 	if c.MuxWindow < c.MuxFrameSize*2 {
 		c.MuxWindow = c.MuxFrameSize * 2
+	}
+	// an explicit mux_window above the profile's limit raises the limit with it
+	if c.MuxMaxWindow < c.MuxWindow {
+		c.MuxMaxWindow = c.MuxWindow
 	}
 	if c.Heartbeat < time.Second {
 		c.Heartbeat = time.Second
@@ -314,7 +322,7 @@ const (
 
 var commonKeys = map[string]string{
 	"transport": kStr, "token": kStr, "keepalive_period": kInt, "nodelay": kBool, "heartbeat": kInt,
-	"mux_framesize": kInt, "mux_window": kInt, "web_port": kInt, "log_level": kStr, "path": kStr,
+	"mux_framesize": kInt, "mux_window": kInt, "mux_max_window": kInt, "web_port": kInt, "log_level": kStr, "path": kStr,
 	"tls_cert": kStr, "tls_key": kStr, "tls_sni": kStr, "tls_insecure": kBool, "channel_size": kInt,
 	"dial_timeout": kInt, "udp_idle_timeout": kInt, "encryption": kBool, "performance": kStr,
 }

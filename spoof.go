@@ -212,8 +212,7 @@ func listenSpoof(cfg *ServerConfig) (TransportListener, error) {
 	if err != nil {
 		return nil, err
 	}
-	sock.SetReadBuffer(8 << 20)
-	sock.SetWriteBuffer(8 << 20)
+	bigBuffers(sock, 8<<20)
 
 	var peer *net.UDPAddr
 	if cfg.PeerAddr != "" {
@@ -256,8 +255,7 @@ func newSpoofDialer(cfg *ClientConfig) Dialer {
 			initErr = err
 			return
 		}
-		sock.SetReadBuffer(8 << 20)
-		sock.SetWriteBuffer(8 << 20)
+		bigBuffers(sock, 8<<20)
 		sender, err := buildSender(sock, cfg.SpoofSource, remoteAddr)
 		if err != nil {
 			sock.Close()

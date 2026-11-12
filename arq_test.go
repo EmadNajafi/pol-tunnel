@@ -71,7 +71,7 @@ func TestARQLossy(t *testing.T) {
 
 			size := 3 << 20 // 3 MB each way; lighter under extreme loss
 			if loss >= 0.3 {
-				size = 1 << 20
+				size = 512 << 10 // integrity is the point here, not speed
 			}
 			payload := make([]byte, size)
 			rand.Read(payload)

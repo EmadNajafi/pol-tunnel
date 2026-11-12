@@ -73,6 +73,7 @@ type directPath struct {
 	idx      int
 	io       pathIO
 	lastSent atomic.Int64 // unix nanos of the last packet sent on this path
+	scratch  []byte       // decrypt buffer, used only by this path's read loop
 }
 
 type directEngine struct {
@@ -81,13 +82,13 @@ type directEngine struct {
 	paths     []*directPath
 	spoofPeer net.IP // server: send to this IP instead of the (forged) source IP
 
-	mu       sync.RWMutex
-	keys     *directKeys   // active session keys
-	replay   *replayWindow // anti-replay state for the active keys
-	peers    []*net.UDPAddr
-	up       bool
-	lastRecv time.Time // last authenticated DATA (incl. keepalives)
-	mtu      int       // current interface MTU
+	mu         sync.RWMutex
+	keys       *directKeys   // active session keys
+	replay     *replayWindow // anti-replay state for the active keys
+	peers      []*net.UDPAddr
+	up         bool
+	lastRecvNs atomic.Int64 // unix nanos of the last authenticated DATA (incl. keepalives)
+	mtu        int          // current interface MTU
 
 	// client
 	clientEph *ecdh.PrivateKey
@@ -296,6 +297,8 @@ func (e *directEngine) sendOn(p *directPath, pkt []byte, dst *net.UDPAddr) {
 	p.lastSent.Store(time.Now().UnixNano())
 }
 
+var directPktPool = sync.Pool{New: func() any { b := make([]byte, 0, 2048); return &b }}
+
 // sendData seals p (empty p = keepalive) with the active keys and sends it on
 // the given path.
 func (e *directEngine) sendData(p []byte, path int) {
@@ -306,8 +309,13 @@ func (e *directEngine) sendData(p []byte, path int) {
 	if !up || k == nil || dst == nil {
 		return // tunnel not established yet: drop (IP will retransmit)
 	}
-	pkt := append([]byte{dirDATA}, k.send.seal(p)...)
+	// one pooled buffer per packet instead of two allocations (the carriers
+	// send synchronously and keep nothing)
+	bp := directPktPool.Get().(*[]byte)
+	pkt := k.send.sealAppend(append((*bp)[:0], dirDATA), p)
 	e.sendOn(e.paths[pi], pkt, dst)
+	*bp = pkt[:0]
+	directPktPool.Put(bp)
 }
 
 // maintain runs once a second: the client (re)sends INIT until established and
@@ -317,7 +325,7 @@ func (e *directEngine) maintain() {
 	for {
 		now := time.Now()
 		e.mu.Lock()
-		up, lastRecv := e.up, e.lastRecv
+		up, lastRecv := e.up, time.Unix(0, e.lastRecvNs.Load())
 		if e.cfg.Role != "server" && up && now.Sub(lastRecv) > directDeadAfter {
 			logf("warn", "direct: no packets from peer for %v, re-handshaking", directDeadAfter)
 			e.up, e.keys, e.replay, e.clientEph, e.initMsg = false, nil, nil, nil, nil
@@ -410,11 +418,12 @@ func flowPath(pkt []byte, n int) int {
 }
 
 // openData authenticates a DATA packet against keys k and replay window rw.
-func openData(k *directKeys, rw *replayWindow, sealed []byte) ([]byte, bool) {
+// openData authenticates and decrypts into dst[:0] (nil = allocate).
+func openData(k *directKeys, rw *replayWindow, sealed, dst []byte) ([]byte, bool) {
 	if k == nil {
 		return nil, false
 	}
-	plain, err := k.recv.open(sealed)
+	plain, err := k.recv.openAppend(dst[:0], sealed)
 	if err != nil {
 		return nil, false
 	}
@@ -475,19 +484,48 @@ func (e *directEngine) deliver(plain []byte, path int) {
 func (e *directEngine) handleData(sealed []byte, src *net.UDPAddr, path int) ([]byte, bool) {
 	e.mu.RLock()
 	k, rw, pk, prw := e.keys, e.replay, e.pending, e.pendingReplay
+	var curPeer *net.UDPAddr
+	if path < len(e.peers) {
+		curPeer = e.peers[path]
+	}
 	e.mu.RUnlock()
 
-	plain, ok := openData(k, rw, sealed)
+	// each path is read by one goroutine, so it can decrypt into its own buffer
+	var scratch []byte
+	if path < len(e.paths) {
+		if e.paths[path].scratch == nil {
+			e.paths[path].scratch = make([]byte, 0, 65535)
+		}
+		scratch = e.paths[path].scratch
+	}
+	plain, ok := openData(k, rw, sealed, scratch)
 	promoted := false
 	if !ok && pk != nil {
 		// first packet under the keys of a fresh handshake: switch to them
-		if plain, ok = openData(pk, prw, sealed); ok {
+		if plain, ok = openData(pk, prw, sealed, scratch); ok {
 			promoted = true
 		}
 	}
 	if !ok {
 		logf("debug", "direct: dropped unauthenticated packet from %v", src)
 		return nil, false
+	}
+	e.lastRecvNs.Store(time.Now().UnixNano())
+
+	// The common packet changes nothing but the timestamp above, so it takes
+	// no write lock (every packet used to, and the sending side contends on
+	// the same mutex for every packet it sends). Only a re-key or a peer that
+	// moved needs it.
+	moved := false
+	if e.cfg.Role == "server" && path < len(e.peers) {
+		wantIP := src.IP
+		if e.spoofPeer != nil {
+			wantIP = e.spoofPeer
+		}
+		moved = curPeer == nil || curPeer.Port != src.Port || !curPeer.IP.Equal(wantIP)
+	}
+	if !promoted && !moved {
+		return plain, true
 	}
 	e.mu.Lock()
 	if promoted && e.pending == pk {
@@ -500,11 +538,10 @@ func (e *directEngine) handleData(sealed []byte, src *net.UDPAddr, path int) ([]
 		}
 		e.up = true
 	}
-	if e.cfg.Role == "server" && path < len(e.peers) {
+	if moved {
 		// roaming: follow the peer's address, but only for authenticated, fresh packets
 		e.peers[path] = e.replyAddr(src)
 	}
-	e.lastRecv = time.Now()
 	e.mu.Unlock()
 	return plain, true
 }
@@ -594,7 +631,8 @@ func (e *directEngine) handleResp(msg []byte) {
 		return
 	}
 	e.keys, e.replay = keys, &replayWindow{}
-	e.up, e.lastRecv = true, time.Now()
+	e.up = true
+	e.lastRecvNs.Store(time.Now().UnixNano())
 	e.mu.Unlock()
 	logf("info", "direct: tunnel established with %v", e.peers[0])
 	for _, p := range e.paths {

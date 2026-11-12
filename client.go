@@ -63,7 +63,7 @@ func (c *Client) muxLoop(i int) {
 			time.Sleep(c.cfg.RetryInterval)
 			continue
 		}
-		sess := NewSession(conn, c.cfg.MuxFrameSize, c.cfg.MuxWindow, c.cfg.Heartbeat)
+		sess := NewSessionTuned(conn, c.cfg.MuxFrameSize, c.cfg.MuxWindow, c.cfg.MuxMaxWindow, c.cfg.Heartbeat)
 		logf("info", "mux #%d connected to %s", i, conn.RemoteAddr())
 		c.links.Add(1)
 		for {

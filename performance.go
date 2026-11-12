@@ -22,7 +22,8 @@ import (
 // do not have to match — but using the same profile on both is the sane setup,
 // since each direction is paced by the receiver's window.
 type perfProfile struct {
-	MuxWindow    int
+	MuxWindow    int // a stream starts with this receive window ...
+	MuxMaxWindow int // ... and may grow to this while the window is what limits it
 	MuxFrameSize int
 	Nodelay      bool
 	ChannelSize  int
@@ -33,6 +34,7 @@ type perfProfile struct {
 	ARQInitCwnd int
 	ARQFloor    int
 	ARQFastRes  int
+	ARQLossTol  float64 // share of resent packets per round taken as path noise, not congestion
 	ARQMinRTO   time.Duration
 	ARQInterval time.Duration
 	ARQDelayAck bool
@@ -40,23 +42,23 @@ type perfProfile struct {
 
 var perfProfiles = map[string]perfProfile{
 	"balance": {
-		MuxWindow: 512 * 1024, MuxFrameSize: 32 * 1024, Nodelay: true, ChannelSize: 2048, Pool: 8,
-		ARQWindow: 1024, ARQInitCwnd: 32, ARQFloor: 8, ARQFastRes: 3,
+		MuxWindow: 512 * 1024, MuxMaxWindow: 4 * 1024 * 1024, MuxFrameSize: 32 * 1024, Nodelay: true, ChannelSize: 2048, Pool: 8,
+		ARQWindow: 1024, ARQInitCwnd: 32, ARQFloor: 8, ARQFastRes: 3, ARQLossTol: 0.02,
 		ARQMinRTO: 50 * time.Millisecond, ARQInterval: 10 * time.Millisecond,
 	},
 	"turbo": {
-		MuxWindow: 2 * 1024 * 1024, MuxFrameSize: 32 * 1024, Nodelay: true, ChannelSize: 2048, Pool: 8,
-		ARQWindow: 1024, ARQInitCwnd: 64, ARQFloor: 16, ARQFastRes: 2,
+		MuxWindow: 2 * 1024 * 1024, MuxMaxWindow: 16 * 1024 * 1024, MuxFrameSize: 32 * 1024, Nodelay: true, ChannelSize: 2048, Pool: 8,
+		ARQWindow: 2048, ARQInitCwnd: 64, ARQFloor: 16, ARQFastRes: 2, ARQLossTol: 0.05,
 		ARQMinRTO: 30 * time.Millisecond, ARQInterval: 10 * time.Millisecond,
 	},
 	"aggressive": {
-		MuxWindow: 8 * 1024 * 1024, MuxFrameSize: 32 * 1024, Nodelay: true, ChannelSize: 4096, Pool: 16,
-		ARQWindow: 2048, ARQInitCwnd: 128, ARQFloor: 64, ARQFastRes: 2,
+		MuxWindow: 8 * 1024 * 1024, MuxMaxWindow: 32 * 1024 * 1024, MuxFrameSize: 32 * 1024, Nodelay: true, ChannelSize: 4096, Pool: 16,
+		ARQWindow: 4096, ARQInitCwnd: 128, ARQFloor: 64, ARQFastRes: 2, ARQLossTol: 0.15,
 		ARQMinRTO: 30 * time.Millisecond, ARQInterval: 10 * time.Millisecond,
 	},
 	"throughput": {
-		MuxWindow: 16 * 1024 * 1024, MuxFrameSize: 65535, Nodelay: false, ChannelSize: 4096, Pool: 8,
-		ARQWindow: 4096, ARQInitCwnd: 128, ARQFloor: 32, ARQFastRes: 3,
+		MuxWindow: 16 * 1024 * 1024, MuxMaxWindow: 64 * 1024 * 1024, MuxFrameSize: 65535, Nodelay: false, ChannelSize: 4096, Pool: 8,
+		ARQWindow: 8192, ARQInitCwnd: 128, ARQFloor: 32, ARQFastRes: 3, ARQLossTol: 0.05,
 		ARQMinRTO: 50 * time.Millisecond, ARQInterval: 20 * time.Millisecond, ARQDelayAck: true,
 	},
 }
@@ -83,7 +85,7 @@ func applyARQProfile(name string) {
 		return // LoadConfig already rejected unknown names
 	}
 	arqTuning.Store(&arqTune{recvWnd: p.ARQWindow, sendCap: p.ARQWindow, initCwnd: p.ARQInitCwnd,
-		cwndFloor: p.ARQFloor, fastResend: p.ARQFastRes, minRTO: p.ARQMinRTO, interval: p.ARQInterval,
+		cwndFloor: p.ARQFloor, fastResend: p.ARQFastRes, lossTol: p.ARQLossTol, minRTO: p.ARQMinRTO, interval: p.ARQInterval,
 		delayAck: p.ARQDelayAck})
 	if name != "" {
 		logf("info", "performance profile: %s", strings.ToLower(name))
