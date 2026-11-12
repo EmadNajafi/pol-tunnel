@@ -43,7 +43,7 @@ func TestPerformanceProfileConfig(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		if c.Server.MuxWindow != p.MuxWindow || c.Server.MuxFrameSize != p.MuxFrameSize || c.Server.Nodelay != p.Nodelay {
+		if c.Server.MuxWindow != p.MuxWindow || c.Server.MuxMaxWindow != p.MuxMaxWindow || c.Server.MuxFrameSize != p.MuxFrameSize || c.Server.Nodelay != p.Nodelay {
 			t.Errorf("%s: server got window=%d frame=%d nodelay=%v", name, c.Server.MuxWindow, c.Server.MuxFrameSize, c.Server.Nodelay)
 		}
 		c, err = loadCfgString(t, cli+"performance = \""+name+"\"\n")
@@ -207,8 +207,8 @@ func (c *delayConn) SetWriteDeadline(time.Time) error { return nil }
 func muxRate(t *testing.T, p perfProfile, oneWay, dur time.Duration) float64 {
 	a, b := delayPipe(oneWay)
 	hb := 5 * time.Second
-	sender := NewSession(a, p.MuxFrameSize, p.MuxWindow, hb)
-	recver := NewSession(b, p.MuxFrameSize, p.MuxWindow, hb)
+	sender := NewSessionTuned(a, p.MuxFrameSize, p.MuxWindow, p.MuxMaxWindow, hb)
+	recver := NewSessionTuned(b, p.MuxFrameSize, p.MuxWindow, p.MuxMaxWindow, hb)
 	defer sender.Close()
 	defer recver.Close()
 
@@ -253,19 +253,29 @@ func muxRate(t *testing.T, p perfProfile, oneWay, dur time.Duration) float64 {
 	return float64(n) * 8 / dur.Seconds() / 1e6 // Mbit/s
 }
 
-// On a path with real latency one mux stream is paced by window / round trip,
-// so the larger windows of turbo and above must carry clearly more than
-// balance does.
-func TestPerformanceProfilesMuxRate(t *testing.T) {
+// On a path with real latency one mux stream is paced by window / round trip.
+// A window that stays at 512 KiB carries about 45 Mbit/s at an 80 ms round
+// trip; the same starting window allowed to grow must carry several times
+// that without any profile being set, and every profile must do at least as
+// well as a fixed window.
+func TestMuxWindowGrowsOnLongPaths(t *testing.T) {
 	const oneWay = 40 * time.Millisecond // an 80 ms round trip, like Iran <-> Europe
-	rates := map[string]float64{}
+	bal := perfProfiles["balance"]
+	fixed := bal
+	fixed.MuxMaxWindow = fixed.MuxWindow // no growth: what pol did before
+	base := muxRate(t, fixed, oneWay, 1500*time.Millisecond)
+	t.Logf("%-22s %7.1f Mbit/s per stream at 80 ms RTT", "fixed 512 KiB window", base)
 	for _, name := range []string{"balance", "turbo", "aggressive", "throughput"} {
-		rates[name] = muxRate(t, perfProfiles[name], oneWay, 1500*time.Millisecond)
-		t.Logf("%-10s window %5d KiB: %7.1f Mbit/s per stream at 80 ms RTT", name, perfProfiles[name].MuxWindow/1024, rates[name])
-	}
-	// (kept loose: under the race detector the CPU, not the window, caps the top rates)
-	if rates["turbo"] < 1.5*rates["balance"] {
-		t.Errorf("turbo (%.1f Mbit/s) should carry clearly more than balance (%.1f Mbit/s)", rates["turbo"], rates["balance"])
+		p := perfProfiles[name]
+		r := muxRate(t, p, oneWay, 1500*time.Millisecond)
+		t.Logf("%-22s %7.1f Mbit/s per stream (window %d KiB, may grow to %d KiB)", name, r, p.MuxWindow/1024, p.MuxMaxWindow/1024)
+		// (kept loose: under the race detector the CPU, not the window, caps the top rates)
+		if name == "balance" && r < 2*base {
+			t.Errorf("balance with a growing window (%.1f Mbit/s) should carry far more than a fixed one (%.1f Mbit/s)", r, base)
+		}
+		if r < base {
+			t.Errorf("%s (%.1f Mbit/s) is slower than a fixed 512 KiB window (%.1f Mbit/s)", name, r, base)
+		}
 	}
 }
 

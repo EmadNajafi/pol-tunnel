@@ -120,20 +120,29 @@ type aeadCounter struct {
 
 // seal encrypts p, returning nonce[12] | ciphertext.
 func (a *aeadCounter) seal(p []byte) []byte {
-	ctr := a.counter.Add(1)
-	nonce := make([]byte, gcmNonce)
-	binary.BigEndian.PutUint64(nonce[4:], ctr)
-	out := make([]byte, gcmNonce, gcmNonce+len(p)+gcmTag)
-	copy(out, nonce)
-	return a.aead.Seal(out, nonce, p, nil)
+	return a.sealAppend(make([]byte, 0, gcmNonce+len(p)+gcmTag), p)
+}
+
+// sealAppend appends nonce[12] | ciphertext for p to dst (no allocation when
+// dst has room: the per-packet paths reuse their buffers).
+func (a *aeadCounter) sealAppend(dst, p []byte) []byte {
+	var nonce [gcmNonce]byte
+	binary.BigEndian.PutUint64(nonce[4:], a.counter.Add(1))
+	dst = append(dst, nonce[:]...)
+	return a.aead.Seal(dst, nonce[:], p, nil)
 }
 
 // open decrypts nonce[12] | ciphertext.
 func (a *aeadCounter) open(buf []byte) ([]byte, error) {
+	return a.openAppend(nil, buf)
+}
+
+// openAppend decrypts nonce[12] | ciphertext, appending the plaintext to dst.
+func (a *aeadCounter) openAppend(dst, buf []byte) ([]byte, error) {
 	if len(buf) < gcmNonce+gcmTag {
 		return nil, errors.New("direct: short packet")
 	}
-	return a.aead.Open(nil, buf[:gcmNonce], buf[gcmNonce:], nil)
+	return a.aead.Open(dst, buf[:gcmNonce], buf[gcmNonce:], nil)
 }
 
 // ---- handshake messages ----

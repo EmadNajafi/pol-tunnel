@@ -179,12 +179,12 @@ func ctBestTable(b *ctBest) string {
 	// window covers what the path needs (throughput is never suggested here —
 	// it trades latency for bulk speed, which is the operator's call)
 	switch {
-	case b.MuxWindowKB > 2048:
+	case b.MuxWindowKB > 16384: // more than turbo's windows grow to
 		row("performance", `"aggressive"`, fmt.Sprintf("%d KB in flight (speed × round trip); uses more RAM", b.BDPKB))
-	case b.MuxWindowKB > 512:
+	case b.MuxWindowKB > 4096: // more than balance's windows grow to
 		row("performance", `"turbo"`, fmt.Sprintf("%d KB in flight (speed × round trip)", b.BDPKB))
 	case b.Down > 0 || b.Up > 0:
-		row("performance", `"balance"`, "round trip too short to need larger windows")
+		row("performance", `"balance"`, "its windows grow far enough for this path by themselves")
 	default:
 		row("performance", `"balance"`, "no speed measured")
 	}

@@ -1361,8 +1361,8 @@ func ctComputeBest(rows []ctResult, cases []*ctCase) *ctBest {
 		if w < 512 {
 			w = 512
 		}
-		if w > 16384 {
-			w = 16384
+		if w > 65536 {
+			w = 65536
 		}
 		b.MuxWindowKB = w
 	}

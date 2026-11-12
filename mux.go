@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -38,7 +39,8 @@ var errSessionClosed = errors.New("session closed")
 type Session struct {
 	conn      net.Conn
 	frameSize int
-	window    int // our receive window per stream
+	window    int // the receive window a stream starts with
+	maxWindow int // how far a stream's receive window may grow on its own
 
 	wmu     sync.Mutex
 	mu      sync.Mutex
@@ -49,13 +51,30 @@ type Session struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 	lastRecv  atomic.Int64
+
+	pingAt atomic.Int64 // unix nanos of the ping awaiting its pong (0 = none)
+	rtt    atomic.Int64 // smallest round trip seen, nanos (0 = not measured yet)
 }
 
+// NewSession is a session whose stream windows stay at `window`.
 func NewSession(c net.Conn, frameSize, window int, heartbeat time.Duration) *Session {
+	return NewSessionTuned(c, frameSize, window, window, heartbeat)
+}
+
+// NewSessionTuned is a session whose stream receive windows start at `window`
+// and grow up to maxWindow while the window, not the reader, is what limits a
+// stream (see Stream.Read). One stream is paced by window / round trip, so on
+// a long path a fixed small window is slow and a fixed large one costs memory
+// for every stream; growing on demand gives the speed only where it is used.
+func NewSessionTuned(c net.Conn, frameSize, window, maxWindow int, heartbeat time.Duration) *Session {
+	if maxWindow < window {
+		maxWindow = window
+	}
 	s := &Session{
 		conn:      c,
 		frameSize: frameSize,
 		window:    window,
+		maxWindow: maxWindow,
 		streams:   map[uint32]*Stream{},
 		nextID:    1,
 		accept:    make(chan *Stream, 1024),
@@ -66,6 +85,15 @@ func NewSession(c net.Conn, frameSize, window int, heartbeat time.Duration) *Ses
 	go s.keepalive(heartbeat)
 	return s
 }
+
+// ping sends a PING and notes when, so the PONG gives a round-trip sample.
+func (s *Session) ping() {
+	s.pingAt.Store(time.Now().UnixNano())
+	s.writeFrame(cmdPING, 0, nil)
+}
+
+// framePool recycles frame buffers: writeFrame used to allocate one per frame.
+var framePool = sync.Pool{New: func() any { b := make([]byte, frameHeader+0xffff); return &b }}
 
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
@@ -99,7 +127,9 @@ func (s *Session) NumStreams() int {
 }
 
 func (s *Session) writeFrame(cmd byte, id uint32, p []byte) error {
-	b := make([]byte, frameHeader+len(p))
+	bp := framePool.Get().(*[]byte)
+	defer framePool.Put(bp)
+	b := (*bp)[:frameHeader+len(p)]
 	b[0] = cmd
 	binary.BigEndian.PutUint32(b[1:], id)
 	binary.BigEndian.PutUint16(b[5:], uint16(len(p)))
@@ -147,6 +177,7 @@ func (s *Session) Accept() (*Stream, error) {
 }
 
 func (s *Session) keepalive(every time.Duration) {
+	go s.ping() // a first round-trip sample right away, for the window tuning
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
@@ -164,16 +195,18 @@ func (s *Session) keepalive(every time.Duration) {
 			// lock, the ping would queue behind it, and the silence check
 			// above would never run again — the session then hung until TCP
 			// itself gave up, many minutes later.
-			go s.writeFrame(cmdPING, 0, nil)
+			go s.ping()
 		}
 	}
 }
 
 func (s *Session) recvLoop() {
 	defer s.Close()
+	// buffered: a frame used to cost two read syscalls (header, then payload)
+	r := bufio.NewReaderSize(s.conn, 64*1024)
 	hdr := make([]byte, frameHeader)
 	for {
-		if _, err := io.ReadFull(s.conn, hdr); err != nil {
+		if _, err := io.ReadFull(r, hdr); err != nil {
 			return
 		}
 		s.lastRecv.Store(time.Now().UnixNano())
@@ -183,7 +216,7 @@ func (s *Session) recvLoop() {
 		var p []byte
 		if n > 0 {
 			p = make([]byte, n)
-			if _, err := io.ReadFull(s.conn, p); err != nil {
+			if _, err := io.ReadFull(r, p); err != nil {
 				return
 			}
 		}
@@ -191,6 +224,13 @@ func (s *Session) recvLoop() {
 		case cmdPING:
 			go s.writeFrame(cmdPONG, 0, nil)
 		case cmdPONG:
+			// a round-trip sample; keep the smallest (a ping can sit behind data
+			// in the write queue, which only ever makes a sample too large)
+			if at := s.pingAt.Swap(0); at != 0 {
+				if d := time.Now().UnixNano() - at; d > 0 && (s.rtt.Load() == 0 || d < s.rtt.Load()) {
+					s.rtt.Store(d)
+				}
+			}
 		case cmdSYN:
 			proto, target, src, ok := decodeOpen(p)
 			if !ok {
@@ -250,19 +290,21 @@ type Stream struct {
 	openAddr  string
 	openSrc   string
 
-	mu       sync.Mutex
-	cond     *sync.Cond
-	rbuf     [][]byte
-	rEOF     bool // peer sent FIN
-	reset    bool // aborted
-	finSent  bool
-	closed   bool
-	sendWnd  int
-	consumed int
+	mu        sync.Mutex
+	cond      *sync.Cond
+	rbuf      [][]byte
+	rEOF      bool // peer sent FIN
+	reset     bool // aborted
+	finSent   bool
+	closed    bool
+	sendWnd   int
+	consumed  int
+	window    int       // current receive window; grows up to sess.maxWindow
+	lastGrant time.Time // when credit was last handed to the peer
 }
 
 func newStream(s *Session, id uint32) *Stream {
-	st := &Stream{id: id, sess: s, sendWnd: initialWindow}
+	st := &Stream{id: id, sess: s, sendWnd: initialWindow, window: s.window}
 	st.cond = sync.NewCond(&st.mu)
 	return st
 }
@@ -337,8 +379,25 @@ func (st *Stream) Read(p []byte) (int, error) {
 	}
 	st.consumed += n
 	credit := 0
-	if st.consumed >= st.sess.window/2 {
+	if st.consumed >= st.window/2 {
 		credit, st.consumed = st.consumed, 0
+		// Self-tuning: half a window was read in under two round trips, so the
+		// window, not the reader, is what holds this stream back — double it
+		// (up to the session's limit) and hand the peer the extra credit too.
+		// A slow reader never gets here, so its window (and the memory it can
+		// pin) stays small.
+		now := time.Now()
+		if st.window < st.sess.maxWindow {
+			if rtt := time.Duration(st.sess.rtt.Load()); rtt > 0 && !st.lastGrant.IsZero() && now.Sub(st.lastGrant) < 2*rtt {
+				grow := st.window
+				if st.window+grow > st.sess.maxWindow {
+					grow = st.sess.maxWindow - st.window
+				}
+				st.window += grow
+				credit += grow
+			}
+		}
+		st.lastGrant = now
 	}
 	st.mu.Unlock()
 	if credit > 0 {

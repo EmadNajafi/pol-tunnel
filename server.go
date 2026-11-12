@@ -86,7 +86,7 @@ func (s *Server) handleTunnelConn(raw net.Conn) {
 	mux := isMux(s.cfg.Transport)
 	switch {
 	case kind == connMux && mux:
-		sess := NewSession(c, s.cfg.MuxFrameSize, s.cfg.MuxWindow, s.cfg.Heartbeat)
+		sess := NewSessionTuned(c, s.cfg.MuxFrameSize, s.cfg.MuxWindow, s.cfg.MuxMaxWindow, s.cfg.Heartbeat)
 		s.sessMu.Lock()
 		s.sessions = append(s.sessions, sess)
 		total := len(s.sessions)

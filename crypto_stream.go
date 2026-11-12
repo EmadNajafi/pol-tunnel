@@ -25,6 +25,9 @@ type aeadConn struct {
 
 	rmu     sync.Mutex
 	readbuf []byte // leftover plaintext from a partial Read
+	wbuf    []byte // reused: one outgoing record (guarded by wmu)
+	cbuf    []byte // reused: one incoming record (guarded by rmu)
+	pbuf    []byte // reused: its plaintext; readbuf points into it
 	expect  uint64 // next record counter we require (anti-replay for the stream)
 }
 
@@ -46,12 +49,11 @@ func (a *aeadConn) Write(p []byte) (int, error) {
 		if n > aeadMaxRecord {
 			n = aeadMaxRecord
 		}
-		sealed := a.keys.send.seal(p[:n]) // nonce[12] | ct+tag
-		// one write per record: len[2] | sealed (avoids a tiny separate packet)
-		rec := make([]byte, 2+len(sealed))
-		binary.BigEndian.PutUint16(rec, uint16(len(sealed)))
-		copy(rec[2:], sealed)
-		if _, err := a.Conn.Write(rec); err != nil {
+		// one write per record: len[2] | nonce[12] | ct+tag, sealed straight
+		// into a buffer that is reused (wmu is held), not allocated per record
+		a.wbuf = a.keys.send.sealAppend(append(a.wbuf[:0], 0, 0), p[:n])
+		binary.BigEndian.PutUint16(a.wbuf, uint16(len(a.wbuf)-2))
+		if _, err := a.Conn.Write(a.wbuf); err != nil {
 			return total, err
 		}
 		total += n
@@ -72,22 +74,24 @@ func (a *aeadConn) Read(p []byte) (int, error) {
 	}
 	n := copy(p, a.readbuf)
 	a.readbuf = a.readbuf[n:]
-	if len(a.readbuf) == 0 {
-		a.readbuf = nil
-	}
 	return n, nil
 }
 
+// readRecord reads and opens one record. The ciphertext and plaintext buffers
+// are reused: it is only called once the previous plaintext is used up.
 func (a *aeadConn) readRecord() ([]byte, error) {
 	var hdr [2]byte
 	if _, err := io.ReadFull(a.Conn, hdr[:]); err != nil {
 		return nil, err
 	}
 	n := int(binary.BigEndian.Uint16(hdr[:]))
-	if n < gcmNonce+gcmTag || n > aeadMaxRecord+gcmNonce+gcmTag {
+	if n < gcmNonce+gcmTag {
 		return nil, errors.New("aead: bad record length")
 	}
-	buf := make([]byte, n)
+	if cap(a.cbuf) < n {
+		a.cbuf = make([]byte, 0, 0xffff)
+	}
+	buf := a.cbuf[:n]
 	if _, err := io.ReadFull(a.Conn, buf); err != nil {
 		return nil, err
 	}
@@ -97,10 +101,11 @@ func (a *aeadConn) readRecord() ([]byte, error) {
 		return nil, errors.New("aead: record counter out of order (replay?)")
 	}
 	a.expect++
-	plain, err := a.keys.recv.open(buf)
+	plain, err := a.keys.recv.openAppend(a.pbuf[:0], buf)
 	if err != nil {
 		return nil, err
 	}
+	a.pbuf = plain
 	return plain, nil
 }
 
